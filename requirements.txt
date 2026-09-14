@@ -1,0 +1,10 @@
+numpy
+scipy
+matplotlib
+pybullet
+gymnasium
+transforms3d
+
+# gym-pybullet-drones is vendored in third_party/ (no PyPI release) and
+# installed separately, without its heavy RL-training extras:
+#   pip install -e third_party/gym-pybullet-drones --no-deps

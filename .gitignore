@@ -1,0 +1,33 @@
+# Python environment (recreate via README's Setup section)
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Vendored third-party library - it's its own git repo (github.com/utiasDSL/
+# gym-pybullet-drones), cloned in place rather than tracked here. See
+# README's Setup section for the exact clone+checkout command.
+third_party/gym-pybullet-drones/
+
+# Mission/SITL run artifacts (regenerated every run, not source)
+results/
+logs/
+tmp/
+mav.tlog
+mav.tlog.raw
+mav.parm
+eeprom.bin
+dumpcore.sh_arducopter.*.out
+dumpstack.sh_arducopter.*.out
+
+# Local Claude Code tool-permission allowlist - machine/session-specific,
+# not shared project config.
+.claude/settings.local.json
+
+# Unused reference material pulled in during early exploration - not
+# referenced by any code (see docs/PHASE0_AUDIT.md). Remove these three
+# lines if you want them tracked anyway; nothing else depends on that
+# choice.
+Autonomous Drone Swarm with Distributed Consensus Algorithm/
+terrain/
+mission_viz_data.json

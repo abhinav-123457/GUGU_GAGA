@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Test framework for swarm_sim's project-level tests (tests/). Not needed to
+# run a mission, only to run the test suite.
+pytest
