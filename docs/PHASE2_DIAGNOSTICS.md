@@ -91,9 +91,45 @@ first observation of a given body pair), computed by comparing this
 event's `actual_clearance_m` against the last one recorded for the same
 pair of PyBullet body IDs.
 
-## Contact classification (scenario 6: 229 logged events)
+## Contact-count reconciliation (diagnostic-only correction)
 
-Every one of the 229 delayed-observation contacts is classified by:
+An earlier version of the Phase 2 diagnostic report quoted **291** contacts
+for scenario 6 (delayed observations) while this document quoted **229**
+for the same run under the same word, "contacts." Both numbers were
+correct - they were just measuring two different things, and a third,
+previously-unreported number sits between them. Rerunning scenario 6
+exactly (see command below) against the current code gives all three,
+now explicit and permanently disambiguated in `MissionDiagnostics.to_report_dict()`:
+
+| Field | Value | What it counts |
+|---|---|---|
+| `raw_contact_point_count` | **291** | Every `p.getContactPoints()` record touching a drone, summed over the whole run. PyBullet can report several manifold points for the *same* touching pair within one tick (e.g. a drone wedged flush against a flat obstacle face) - this is the number that was previously reported as "contacts" in the chat report. |
+| `deduplicated_contact_event_count` | **233** | `raw_contact_point_count` collapsed to one entry per distinct (tick, body-pair) - the semantically meaningful "how many separate touching incidents" count. Not reported at all before this fix. |
+| `contact_step_count` | **229** | Simulation ticks with >=1 relevant contact (mission.py's pre-existing `_contact_steps`, unchanged) - this is the number that was previously reported as "logged events" in this document. It is *lower* than the deduplicated event count because more than one distinct pair can be in contact during the same tick (e.g. two different drones each wedged against a different obstacle simultaneously count as 1 step but 2 events). |
+| `drone_obstacle_contact_count` | **233** | Deduplicated events classified `drone_obstacle`. |
+| `drone_drone_contact_count` | **0** | Deduplicated events classified `drone_drone`. |
+| `drone_ground_contact_count` | **0** | Deduplicated events classified `drone_ground`. |
+
+`drone_obstacle_contact_count + drone_drone_contact_count + drone_ground_contact_count
+== deduplicated_contact_event_count` always holds (233 = 233 + 0 + 0) - this is
+the invariant `tests/test_diagnostics.py` guards against regressing. This
+also reconfirms, with exact numbers instead of an estimate, the earlier
+finding: every scenario-6 contact is drone-vs-obstacle, none drone-drone
+or drone-ground.
+
+**Reproduction.** Config, seed, and everything else held exactly as before:
+
+```
+python scripts/regenerate_phase2_diagnostics.py 6_delayed_observations
+```
+
+- Scenario config: `num_drones=6, num_victims=5, num_obstacles=4, duration_sec=90.0, seed=42, gui=False`, overridden with `victim_sensor_latency_steps=10, neighbor_sensor_latency_steps=10, obstacle_sensor_latency_steps=5` (all other sensor/communication fields at `MissionConfig` defaults).
+- Git commit this rerun was taken at: `74cd1bd4eda996fa38d38348a5befe7237f4ab8a`.
+- Generated result file: `results/phase2_diagnostics/6_delayed_observations.json` (gitignored - regenerate with the command above rather than expecting it in the repo; `scripts/regenerate_phase2_diagnostics.py` is the committed, deterministic source of truth for how it's produced).
+
+## Contact classification (scenario 6: 291 raw points / 233 deduplicated events / 229 contact-steps - see reconciliation above)
+
+Every one of the 233 deduplicated delayed-observation contact events is classified by:
 `category` (`drone_drone` / `drone_obstacle` / `drone_ground`),
 `t`, `body_a`/`body_b` (PyBullet body IDs) and `drone_ids_involved`,
 `sensor_age_s` (the `packet_age_s` of whichever drone's `NeighborObservation`
@@ -125,7 +161,7 @@ exact stand-in.
 
 ### CRITICAL LIMITATION
 
-**Every one of these 229 contacts happened. Nothing detected, prevented,
+**Every one of these 233 contact events happened. Nothing detected, prevented,
 or responded to any of them.** `_classify_and_log_contacts` runs *after*
 the physics step that already produced the contact - it is a strictly
 retrospective evaluation instrument. There is no independent safety
@@ -210,3 +246,9 @@ python -m pytest -q
 ```
 134 passed (128 unchanged from before this follow-up + 6 new architecture
 tests). No existing test's expected value changed.
+
+**Contact-count reconciliation follow-up** (see "Contact-count
+reconciliation" above) added 3 more tests
+(`tests/test_diagnostics.py`, PyBullet-free) for the raw/deduplicated/step
+contact accounting: 137 passed total, same rerun command, no existing
+test's expected value changed.
