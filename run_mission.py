@@ -5,13 +5,16 @@ from swarm_sim.config import MissionConfig
 from swarm_sim.mission import FloodSearchMission
 
 
-def main():
+def build_parser():
+    """Split out from main() so tests/test_run_mission_cli.py can exercise
+    argument parsing (e.g. --flock-model's accepted/rejected choices)
+    without running a full mission."""
     parser = argparse.ArgumentParser(description="Bio-inspired drone swarm SAR simulation (flood scenario)")
     parser.add_argument("--drones", type=int, default=6)
     parser.add_argument("--victims", type=int, default=5)
     parser.add_argument("--obstacles", type=int, default=4)
     parser.add_argument("--duration", type=float, default=90.0)
-    parser.add_argument("--flock-model", choices=["couzin", "boids", "vicsek"], default="couzin")
+    parser.add_argument("--flock-model", choices=["couzin", "boids", "vicsek", "olfati_saber"], default="couzin")
     parser.add_argument("--max-speed", type=float, default=5.0, help="per-drone speed cap, m/s")
     parser.add_argument("--cruise-speed", type=float, default=2.5, help="nominal search speed, m/s")
     parser.add_argument("--gui", action="store_true")
@@ -23,7 +26,11 @@ def main():
     parser.add_argument("--comm-latency", type=int, default=2, help="message latency, control steps")
     parser.add_argument("--consensus-quorum", type=int, default=2,
                          help="independent drones' reports required to confirm a detection")
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     cfg = MissionConfig(
         num_drones=args.drones,

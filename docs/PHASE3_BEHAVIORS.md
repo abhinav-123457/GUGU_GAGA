@@ -23,8 +23,16 @@ Every behavior function's public entry point (`*_steer`/`*_direction`/
 contract-compliant wrapper) returns a 3-vector velocity in the LOCAL_ENU
 frame (`swarm_sim.contracts.Frame.LOCAL_ENU`), units meters/second, z
 always 0 (this simulator holds altitude via a separate position-hold
-loop - see `mission.py`'s PID call). Three shared guarantees, enforced by
-`common.py`'s helpers rather than reimplemented per model:
+loop - see `mission.py`'s PID call).
+
+**Native output categories** (which raw quantity each model computes
+before bounding is applied - see `swarm_sim/behaviors/common.py`'s module
+docstring for the full explanation):
+- **Acceleration-shaped**: Boids, Olfati-Saber.
+- **Heading-shaped**: Vicsek, Couzin.
+
+Three shared guarantees, enforced by `common.py`'s helpers rather than
+reimplemented per model:
 
 - **Finite, never NaN** (`sanitize_vector`/`bounded_heading`): a
   degenerate raw result (zero-length, NaN, Inf - e.g. from a coincident

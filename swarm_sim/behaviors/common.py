@@ -11,6 +11,28 @@ apply anything to a vehicle, construct a Command, or are called from
 anywhere but SwarmController.step() - they generate candidates that
 SwarmController (and, from Phase 4 on, the safety supervisor sitting in
 front of it) may still override. See docs/PHASE3_BEHAVIORS.md.
+
+Native output categories, i.e. which raw quantity each model computes
+BEFORE this module's bounding is applied (this determines which helper
+below a given model's *_candidate_command wrapper uses):
+
+- ACCELERATION-shaped: Boids (boids.py) and the Olfati-Saber-inspired
+  controller (olfati_saber.py). Both compute a steering FORCE - directly
+  interpretable as the `u_i` input to a double-integrator (q_dot=p,
+  p_dot=u), matching Reynolds' and Olfati-Saber's own formulations. Their
+  *_candidate_command wrappers use clamp_acceleration on the raw force,
+  integrate one Euler step, then clamp_speed the result.
+- HEADING-shaped: Vicsek (vicsek.py) and Couzin (couzin.py). Both compute
+  a desired DIRECTION, not a force. Their *_candidate_command wrappers use
+  clamp_turn_rate (bounding how fast that heading may change from the
+  previous step, not the resulting acceleration) then scale to a speed
+  and clamp_speed it.
+
+This is why clamp_acceleration and clamp_turn_rate are two separate
+helpers rather than one: they bound two different native quantities, and
+a turn-rate bound does not imply a bounded acceleration (for circular
+motion, acceleration = speed * turn_rate) or vice versa - see the
+"remaining risks" note in docs/PHASE3_BEHAVIORS.md's benchmark results.
 """
 import numpy as np
 

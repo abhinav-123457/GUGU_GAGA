@@ -132,7 +132,7 @@ here actually need.)
 ```
 
 Key options:
-- `--flock-model {couzin,boids,vicsek}` - swap the coordination model
+- `--flock-model {couzin,boids,vicsek,olfati_saber}` - swap the coordination model
 - `--max-speed`, `--cruise-speed` - per-run speed caps (m/s); `SpeedController.set_max_speed(drone_id, mps)` also allows changing an individual drone's cap at runtime
 - `--comm-range`, `--packet-loss`, `--comm-latency` - stress the UAV<->UAV network (radio range, loss probability at max range, message delay in control steps); watch `swarm_connectivity_fraction` in the summary and `num_neighbors` in the telemetry CSV respond
 - `--consensus-quorum` - how many independent drones must agree before a victim detection is confirmed (1 = old instant single-drone behavior)
