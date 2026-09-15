@@ -43,12 +43,60 @@ class MissionConfig:
 
     # Distributed consensus on victim detections (replaces single-drone instant
     # confirmation): each drone reports a noisy candidate; a location is only
-    # confirmed once independent drones' reports agree.
-    sensor_range: float = 3.0            # onboard sensor detection range, meters (a cone, not a pinpoint)
-    sensor_noise_std: float = 0.5        # gaussian noise (meters) on a raw sensed victim position
+    # confirmed once independent drones' reports agree. Unchanged in Phase 2 -
+    # see swarm_sim/sensors.py for what now feeds it.
     consensus_quorum: int = 2            # independent drones' reports required before confirming
     consensus_cluster_radius: float = 3.0    # max spread among reports to count as the same detection
     consensus_window_sec: float = 10.0       # how long an unconfirmed report stays eligible
+
+    # Phase 2 sensing: victim detection sensor (swarm_sim/sensors.py
+    # VictimSensorModel). Replaces the old ground-truth-distance-gated
+    # detection check - range/FOV/occlusion/noise/false-negative/
+    # false-positive/latency/dropout all apply before anything reaches
+    # ConsensusBoard.
+    victim_sensor_range_m: float = 6.0
+    victim_sensor_hfov_deg: float = 90.0         # horizontal field of view, full cone angle
+    victim_sensor_vfov_deg: float = 140.0        # vertical FOV, full cone angle measured from nadir
+                                                  # (straight down) - wide enough that a target at max
+                                                  # victim_sensor_range_m and default flight_altitude
+                                                  # is still inside the cone; see sensors.py for why
+                                                  # nadir, not horizontal, is the cone's center
+    victim_sensor_noise_std_m: float = 0.4       # gaussian noise on a genuine detection's reported position
+    victim_sensor_false_negative_prob: float = 0.08   # probability an in-range, in-FOV, unoccluded victim is missed
+    victim_sensor_false_positive_rate: float = 0.01   # probability per drone per step of a spurious detection
+    victim_sensor_latency_steps: int = 1         # control steps between sensing and the observation being usable
+    victim_sensor_dropout_prob: float = 0.03     # probability this tick's whole detection observation is lost
+    victim_sensor_confidence: float = 0.85       # confidence assigned to a genuine detection
+    victim_sensor_false_positive_confidence: float = 0.45   # confidence assigned to a spurious detection
+    victim_sensor_localization_uncertainty_m: float = 0.4   # reported 1-sigma uncertainty radius
+
+    # Phase 2 sensing: obstacle range sensor (swarm_sim/sensors.py
+    # ObstacleRangeSensor). Replaces SwarmController's direct read of
+    # ground-truth obstacle centers with a fixed-angular-bin range scan.
+    obstacle_sensor_range_m: float = 6.0
+    obstacle_sensor_fov_deg: float = 270.0
+    obstacle_sensor_num_bins: int = 16
+    obstacle_sensor_noise_std_m: float = 0.25
+    obstacle_sensor_dropout_prob: float = 0.02   # a dropped-out scan reads as "nothing in range" (+inf), not a
+                                                   # separate flag - fail-empty, same as a real sensor with no return
+    obstacle_sensor_latency_steps: int = 0
+
+    # Phase 2 sensing: local neighbor proximity sensor (swarm_sim/sensors.py
+    # NeighborSensorModel). Replaces SwarmController's direct read of the
+    # ground-truth drone-position array for collision avoidance. Distinct
+    # from CommsNetwork/sensing_radius above, which remain the (already
+    # comms-realistic) channel flocking cohesion uses - this sensor is
+    # onboard (no radio), used only by the hard-safety avoidance branch, so
+    # a degraded comms link still can never be what degrades collision
+    # safety.
+    neighbor_sensor_range_m: float = 6.0
+    neighbor_sensor_fov_deg: float = 270.0
+    neighbor_sensor_noise_std_m: float = 0.3
+    neighbor_sensor_velocity_noise_std_mps: float = 0.2
+    neighbor_sensor_latency_steps: int = 0
+    neighbor_sensor_dropout_prob: float = 0.03
+    neighbor_sensor_stale_timeout_steps: int = 3   # age beyond which a still-cached reading is marked stale
+    neighbor_sensor_confidence: float = 0.9
 
     # Speed control
     cruise_speed_mps: float = 2.5

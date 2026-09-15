@@ -7,7 +7,21 @@ Drives DSLPIDControl directly (rather than VelocityAviary's action
 shortcut) so target velocities are tracked in real m/s with no hidden
 scaling ceiling - the per-drone speed cap in MissionConfig/SpeedController
 is the actual physical limit that gets applied.
+
+Phase 2 sensing boundary: this file is where hidden ground truth (victim
+positions, obstacle geometry, the physics engine's exact drone-position
+array) legitimately lives, because it is the simulator's hidden plant -
+but past this file, it goes one of exactly two ways:
+  1. through swarm_sim/sensors.py's sensor models, which turn it into
+     noisy/range-limited/latent SensorObservation and NeighborObservation
+     contracts before SwarmController ever sees it, or
+  2. into a function clearly marked as scoring/evaluation-only
+     (_match_victim, _classify_detections_for_scoring, the connectivity/
+     clearance/contact bookkeeping in run()) - never fed back into a
+     controller decision.
+See docs/PHASE2_SENSING.md for the full model.
 """
+import math
 import time as timemod
 
 import numpy as np
@@ -18,10 +32,14 @@ from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 from gym_pybullet_drones.utils.enums import DroneModel, Physics
 from gym_pybullet_drones.utils.utils import sync
 
+from . import sensors
 from .consensus import ConsensusBoard
+from .contracts import Frame, HealthState, SensorObservation, VehicleState
 from .controller import SwarmController
 from .network import CommsNetwork
 from .recruitment import RecruitmentBoard
+from .seeding import SeedManager
+from .sensors import NeighborSensorModel, ObstacleRangeSensor, VictimSensorModel
 from .speed_control import SpeedController
 from .telemetry import TelemetryHub
 
@@ -69,12 +87,40 @@ class FloodSearchMission:
         self.speed_ctrl = SpeedController(config.num_drones, config.max_speed_mps, airframe_max_speed)
 
         self.obstacles = self._sample_obstacle_positions(half, init_xyz[:, :2])
-        self.controller = SwarmController(config, config.num_drones, self.rng, obstacles=self.obstacles)
-
         self.victims = self.rng.uniform(-half * 0.85, half * 0.85, size=(config.num_victims, 2))
         self.victims_found = set()
         self._victim_bodies = []
         self._drone_label_ids = [-1] * config.num_drones
+        self._drone_id_set = set(self.env.getDroneIds())
+
+        self.controller = SwarmController(config, config.num_drones, self.rng)
+
+        # Phase 2 sensing: three independent RNG streams (never one shared
+        # stream - see docs/PHASE2_SENSING.md), scoped just to sensing so
+        # the rest of this mission's existing RNG usage is untouched.
+        self._sensor_seeds = SeedManager(config.seed)
+        self.victim_sensor = VictimSensorModel(
+            config, config.num_drones, self.victims, self.obstacles,
+            self._sensor_seeds.rng("victim_sensor"),
+        )
+        self.obstacle_sensor = ObstacleRangeSensor(
+            config, config.num_drones, self.obstacles, self._sensor_seeds.rng("obstacle_sensor"),
+        )
+        self.neighbor_sensor = NeighborSensorModel(
+            config, config.num_drones, self._sensor_seeds.rng("neighbor_sensor"),
+        )
+
+        # Scenario-report bookkeeping (scoring/evaluation only - see run()).
+        self._true_positive_detections = 0
+        self._false_positive_detections = 0
+        self._missed_detections = 0
+        self._observation_opportunities = 0
+        self._localization_errors = []
+        self._detection_latencies_s = []
+        self._neighbor_obs_ages_s = []
+        self._min_sensor_observed_clearance_m = math.inf
+        self._min_ground_truth_clearance_m = math.inf
+        self._contact_steps = 0
 
         self._spawn_obstacles()
         if config.gui:
@@ -145,12 +191,11 @@ class FloodSearchMission:
             self._victim_bodies.append(body)
 
     def _match_victim(self, centroid):
-        """Map a consensus-confirmed centroid back to the nearest
-        still-unconfirmed victim, purely for scoring - the swarm itself
-        only ever acts on `centroid`, never on ground truth. Returns None
-        if nothing plausible is nearby (a false-positive consensus, e.g.
-        sensor noise from two drones independently misreading empty water
-        as the same false location)."""
+        """SCORING ONLY. Map a consensus-confirmed centroid back to the
+        nearest still-unconfirmed victim - the swarm itself only ever acts
+        on `centroid`, never on ground truth. Returns None if nothing
+        plausible is nearby (a false-positive consensus, e.g. two drones
+        independently hallucinating the same false location)."""
         cfg = self.cfg
         best_vid, best_d = None, cfg.consensus_cluster_radius * 2
         for vid, victim_xy in enumerate(self.victims):
@@ -161,34 +206,96 @@ class FloodSearchMission:
                 best_vid, best_d = vid, d
         return best_vid
 
-    def _check_detections(self, positions, t):
-        """Each drone within its own sensor range of a victim submits a
-        noisy candidate report (von-Frisch-style: report what you sensed,
-        don't assume it's confirmed). A victim only becomes an actionable
-        beacon once ConsensusBoard sees enough independent, mutually
-        consistent reports - see consensus.py."""
-        client = self.env.getPyBulletClient() if self.cfg.gui else None
+    def _classify_detections_for_scoring(self, drone_xy, heading_xy, detections, already_found_mask):
+        """SCORING ONLY - reads ground truth to label this tick's already-
+        sensed detections as matching a real victim or not, and to count
+        missed-detection opportunities, for the scenario report. Reuses
+        VictimSensorModel.is_occluded (pure geometry, no RNG) so
+        "observable" here means exactly what the sensor itself would have
+        been able to see before its own noise/false-negative draw - this
+        never changes what was already sensed or fed to consensus, it only
+        labels it after the fact."""
         cfg = self.cfg
-        for vid, (vx, vy) in enumerate(self.victims):
-            if vid in self.victims_found:
-                continue
-            dists = np.linalg.norm(positions[:, :2] - np.array([vx, vy]), axis=1)
-            for drone_id in np.where(dists < cfg.sensor_range)[0]:
-                noisy = np.array([vx, vy]) + self.rng.normal(scale=cfg.sensor_noise_std, size=2)
-                self.consensus.submit(int(drone_id), noisy, t)
+        # Floored so this doesn't degenerate to a zero-radius window (and
+        # therefore reject even an exact, noise-free match) when
+        # victim_sensor_noise_std_m == 0 - e.g. a "perfect sensing"
+        # scenario config.
+        match_radius = max(cfg.victim_sensor_noise_std_m * 4, 0.25)
+        matched_vids = set()
+        for candidate in detections:
+            cand_xy = np.array(candidate.position_m)
+            best_vid, best_d = None, match_radius
+            for vid, victim_xy in enumerate(self.victims):
+                d = float(np.linalg.norm(victim_xy - cand_xy))
+                if d < best_d:
+                    best_vid, best_d = vid, d
+            if best_vid is not None:
+                self._true_positive_detections += 1
+                self._localization_errors.append(best_d)
+                matched_vids.add(best_vid)
+            else:
+                self._false_positive_detections += 1
 
+        for vid, victim_xy in enumerate(self.victims):
+            if already_found_mask[vid]:
+                continue
+            rel_xy = victim_xy - drone_xy
+            horiz_dist = float(np.linalg.norm(rel_xy))
+            if horiz_dist > cfg.victim_sensor_range_m:
+                continue
+            if sensors._horizontal_bearing(heading_xy, rel_xy) > math.radians(cfg.victim_sensor_hfov_deg) / 2:
+                continue
+            if self.victim_sensor.is_occluded(drone_xy, victim_xy):
+                continue
+            self._observation_opportunities += 1
+            if vid not in matched_vids:
+                self._missed_detections += 1
+
+    def _submit_detections(self, drone_id, detections, t):
+        """Feed this drone's sensed victim-detection candidates (from
+        VictimSensorModel - never ground truth) into ConsensusBoard.
+        ConsensusBoard itself is unchanged by Phase 2 - only what feeds it
+        changed."""
+        for candidate in detections:
+            self.consensus.submit(drone_id, np.array(candidate.position_m), t)
+
+    def _resolve_confirmed_detections(self, t):
+        """Drain ConsensusBoard for anything newly confirmed this tick
+        (run once, after every drone's reports for this tick are in).
+        Ground truth is read here ONLY to score a confirmed centroid
+        against the nearest still-missing victim (_match_victim) - the
+        swarm itself only ever acts on the centroid via
+        RecruitmentBoard.announce."""
+        client = self.env.getPyBulletClient() if self.cfg.gui else None
         result = self.consensus.try_confirm(t)
         while result is not None:
             centroid, drones = result
             vid = self._match_victim(centroid)
             if vid is not None:
                 self.victims_found.add(vid)
-                self.board.announce(vid, [centroid[0], centroid[1], cfg.flight_altitude], min(drones), t)
-                if cfg.gui and vid < len(self._victim_bodies):
+                self.board.announce(vid, [centroid[0], centroid[1], self.cfg.flight_altitude], min(drones), t)
+                if self.cfg.gui and vid < len(self._victim_bodies):
                     p.changeVisualShape(self._victim_bodies[vid], -1, rgbaColor=[0.25, 0.85, 0.55, 1], physicsClientId=client)
             else:
                 self.false_confirmations += 1
             result = self.consensus.try_confirm(t)
+
+    def _track_clearance_and_contacts(self, i, positions, neighbor_obs):
+        """SCORING ONLY. Two deliberately separate metrics: what this
+        drone's own sensors believed (sensor-observed clearance - what a
+        future safety supervisor would actually have to work with) versus
+        ground truth (evaluation only, never fed back into any
+        decision)."""
+        if neighbor_obs:
+            sensed = min(
+                float(np.linalg.norm(positions[i] - np.array(n.measured_position_m))) for n in neighbor_obs
+            )
+            self._min_sensor_observed_clearance_m = min(self._min_sensor_observed_clearance_m, sensed)
+
+        true_dists = np.linalg.norm(positions - positions[i], axis=1)
+        true_dists[i] = np.inf
+        if self.cfg.num_drones > 1:
+            self._min_ground_truth_clearance_m = min(self._min_ground_truth_clearance_m, float(np.min(true_dists)))
 
     def _update_drone_labels(self, positions):
         """Floating 'D{i}' label above each drone, updated in place each step
@@ -208,6 +315,7 @@ class FloodSearchMission:
     def run(self):
         cfg = self.cfg
         n_steps = int(cfg.duration_sec * cfg.control_freq_hz)
+        dt = 1.0 / cfg.control_freq_hz
         rpm_action = np.zeros((cfg.num_drones, 4))
         start_wall = timemod.time()
         t = 0.0
@@ -216,23 +324,73 @@ class FloodSearchMission:
             t = step / cfg.control_freq_hz
             obs, _, _, _, _ = self.env.step(rpm_action)
 
+            # Ground truth from here to the sensor-model calls below is fed
+            # ONLY into: (a) the sensor models (their explicitly-permitted
+            # hidden-plant input), (b) CommsNetwork (already comms-realistic,
+            # unchanged since before Phase 2), and (c) scoring/telemetry.
+            # SwarmController.step() below never receives `positions` or
+            # `velocities` directly.
             positions = obs[:, 0:3]
             rpys = obs[:, 7:10]
             velocities = obs[:, 10:13]
 
             self.network.tick(positions, velocities)
-            self._check_detections(positions, t)
+            self.neighbor_sensor.tick(positions, velocities, self.controller.headings)
             self.board.service_check(positions, arrival_radius=cfg.arrival_radius)
-            self.board.decay(1.0 / cfg.control_freq_hz)
+            self.board.decay(dt)
 
             comp_sizes = self.network.connected_component_sizes(cfg.comm_max_age_steps)
             self._connected_steps += int(len(comp_sizes) == 1)
             self._connectivity_checks += 1
 
-            desired_vels = self.controller.step(positions, velocities, self.board, self.network)
+            client = self.env.getPyBulletClient()
+            if any(c[1] in self._drone_id_set or c[2] in self._drone_id_set
+                   for c in p.getContactPoints(physicsClientId=client)):
+                self._contact_steps += 1
+
+            already_found_mask = [vid in self.victims_found for vid in range(cfg.num_victims)]
 
             for i in range(cfg.num_drones):
-                target_vel, applied_speed = self.speed_ctrl.to_velocity_command(i, desired_vels[i])
+                heading_xy = self.controller.headings[i][:2].copy()
+
+                own_state = VehicleState(
+                    vehicle_id=f"drone{i}", sim_time_s=t, frame=Frame.LOCAL_ENU,
+                    position_m=tuple(float(x) for x in positions[i]),
+                    velocity_mps=tuple(float(x) for x in velocities[i]),
+                    acceleration_mps2=(0.0, 0.0, 0.0),
+                    attitude_rad=tuple(float(x) for x in rpys[i]),
+                    angular_velocity_radps=(0.0, 0.0, 0.0),
+                    battery_fraction=1.0, health_state=HealthState.OK,
+                    estimator_valid=True, last_valid_command_time_s=t,
+                )
+
+                detections, dropped = self.victim_sensor.sense(
+                    i, positions[i], heading_xy, t, already_found_mask,
+                )
+                range_returns = self.obstacle_sensor.scan(i, positions[i, :2], heading_xy)
+                sensor_obs = SensorObservation(
+                    vehicle_id=f"drone{i}",
+                    sensor_timestamp_s=max(0.0, t - cfg.victim_sensor_latency_steps * dt),
+                    sensor_latency_s=cfg.victim_sensor_latency_steps * dt,
+                    fov_deg=cfg.victim_sensor_hfov_deg,
+                    range_returns_m=range_returns,
+                    occluded=tuple(False for _ in range_returns),
+                    dropout=dropped, pose_uncertainty_m=0.0,
+                    detections=detections,
+                )
+                neighbor_obs = self.neighbor_sensor.observations_for(i, dt)
+
+                self._classify_detections_for_scoring(positions[i, :2], heading_xy, detections, already_found_mask)
+                self._submit_detections(i, detections, t)
+                self._detection_latencies_s.extend([sensor_obs.sensor_latency_s] * len(detections))
+                self._neighbor_obs_ages_s.extend(n.packet_age_s for n in neighbor_obs)
+                self._track_clearance_and_contacts(i, positions, neighbor_obs)
+
+                desired_vel = self.controller.step(
+                    i, own_state, sensor_obs, neighbor_obs, self.board, self.network,
+                )
+
+                target_vel, applied_speed = self.speed_ctrl.to_velocity_command(i, desired_vel)
                 # Anchor altitude via real position feedback (z held at flight_altitude);
                 # x/y are left to pure velocity tracking so the swarm behavior drives motion.
                 # Yaw is held at a fixed setpoint (0) rather than "current yaw" - the latter
@@ -252,6 +410,8 @@ class FloodSearchMission:
                                        float(np.linalg.norm(velocities[i])), mode, applied_speed,
                                        num_neighbors)
 
+            self._resolve_confirmed_detections(t)
+
             if cfg.gui:
                 if step % 4 == 0:  # a few times a second is plenty legible, and far gentler on the debug renderer
                     self._update_drone_labels(positions)
@@ -263,6 +423,10 @@ class FloodSearchMission:
         self.env.close()
         connectivity_fraction = (self._connected_steps / self._connectivity_checks
                                   if self._connectivity_checks else 1.0)
+        mean_localization_error = (float(np.mean(self._localization_errors))
+                                    if self._localization_errors else None)
+        mean_neighbor_obs_age = (float(np.mean(self._neighbor_obs_ages_s))
+                                  if self._neighbor_obs_ages_s else None)
         return {
             "victims_found": len(self.victims_found),
             "total_victims": cfg.num_victims,
@@ -270,4 +434,18 @@ class FloodSearchMission:
             "telemetry": self.telemetry,
             "false_confirmations": self.false_confirmations,
             "swarm_connectivity_fraction": connectivity_fraction,
+            # Phase 2 sensing/scoring metrics - see docs/PHASE2_SENSING.md
+            "true_positive_detections": self._true_positive_detections,
+            "false_positive_detections": self._false_positive_detections,
+            "missed_detections": self._missed_detections,
+            "observation_opportunities": self._observation_opportunities,
+            "mean_localization_error_m": mean_localization_error,
+            "mean_neighbor_observation_age_s": mean_neighbor_obs_age,
+            "min_sensor_observed_clearance_m": (
+                None if math.isinf(self._min_sensor_observed_clearance_m) else self._min_sensor_observed_clearance_m
+            ),
+            "min_ground_truth_clearance_m": (
+                None if math.isinf(self._min_ground_truth_clearance_m) else self._min_ground_truth_clearance_m
+            ),
+            "contact_steps": self._contact_steps,
         }

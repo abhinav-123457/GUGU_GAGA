@@ -26,6 +26,11 @@ swarm_sim/
   config.py        MissionConfig - every tunable parameter, one place
   behaviors/        boids.py, vicsek.py, couzin.py, levy_flight.py (pure functions, one per paper)
   network.py        CommsNetwork - simulated UAV<->UAV radio: range, packet loss, latency
+  sensors.py        VictimSensorModel / ObstacleRangeSensor / NeighborSensorModel -
+                     the only place ground truth is read to produce noisy/range-limited
+                     SensorObservation/NeighborObservation contracts (see PHASE2_SENSING.md)
+  contracts.py      Versioned data contracts (WorldState/VehicleState/SensorObservation/
+                     NeighborObservation/Command/SafetyDecision) - see PHASE1_CONTRACT.md
   consensus.py       ConsensusBoard - multi-drone agreement before a detection becomes a beacon
   recruitment.py    RecruitmentBoard - von Frisch/Bonabeau-style beacon signaling
   speed_control.py  SpeedController - per-drone speed cap, real m/s, runtime-adjustable
@@ -58,14 +63,25 @@ never be the thing that degrades hard safety. This mirrors the
 architecture principle of keeping safety-critical control below the
 experimental swarm-intelligence layer.
 
-Victim detection is no longer instant/exact either. Each drone within its
-own `sensor_range` of a victim reports a *noisy* candidate position
-(`sensor_noise_std`) to `ConsensusBoard`. A location only becomes an
-actionable beacon once `consensus_quorum` independent drones' reports agree
-(within `consensus_cluster_radius`, inside a `consensus_window_sec` time
-window) - one drone's noisy reading is never enough on its own. Reports
-that cluster together but don't match any real victim are counted as
-`false_confirmations` in the mission summary.
+Victim detection is no longer instant/exact either. `swarm_sim/sensors.py`'s
+`VictimSensorModel` gates each drone's sensing by range, horizontal/vertical
+field of view, and obstacle occlusion, then applies Gaussian position noise,
+a false-negative probability, an independent false-positive probability,
+whole-observation dropout, and fixed latency, before anything reaches
+`ConsensusBoard` - see `docs/PHASE2_SENSING.md` for the full model. A
+location only becomes an actionable beacon once `consensus_quorum`
+independent drones' reports agree (within `consensus_cluster_radius`, inside
+a `consensus_window_sec` time window) - one drone's noisy reading is never
+enough on its own. Reports that cluster together but don't match any real
+victim are counted as `false_confirmations` in the mission summary.
+
+Collision avoidance and obstacle repulsion are sensed the same way -
+`ObstacleRangeSensor` (a fixed-angular-bin range scan) and
+`NeighborSensorModel` (onboard proximity sensing, independent of
+`CommsNetwork`) replace what used to be a direct read of ground-truth
+obstacle/drone positions. `SwarmController` itself never receives ground
+truth at all now - enforced by both a static guard and a behavioral test,
+see `docs/PHASE2_SENSING.md`.
 
 This is bookkeeping-level consensus (`ConsensusBoard` sees all reports
 directly, the same way `RecruitmentBoard` already worked), not a
@@ -147,12 +163,15 @@ here - a production system would want a larger safety margin, and ideally
 should not rely on a single simplified PID for collision-critical braking.
 
 **This is a research/prototype simulation of the coordination algorithms,
-not a flight-ready or certified system.** Real deployment - on real
-hardware, for real search-and-rescue operations - would additionally need:
-sensor-realistic perception (this sim uses ground-truth positions, not
-simulated cameras/LiDAR/GPS-denied localization, even though the paper
-folder this project started from is full of exactly that literature),
-communication-range and bandwidth constraints between real radios, battery
-and endurance modeling, regulatory/airspace compliance, and safety
-certification appropriate to flying multiple aircraft near people. Treat
-this as the algorithm layer to build on, not the finished product.
+not a flight-ready or certified system.** `SwarmController` no longer sees
+ground truth (`docs/PHASE2_SENSING.md`) - victim detection, obstacle
+avoidance, and collision avoidance all go through range/FOV/noise/dropout/
+latency-limited sensor models now - but a drone's own position/velocity
+estimate is still perfect (no simulated GPS-denied localization/EKF drift
+on *own* state yet, even though the paper folder this project started from
+is full of exactly that literature), there's still no independent safety
+supervisor to catch a bad sensor reading (Phase 4), battery/endurance
+modeling doesn't exist, and nothing here has undergone regulatory/airspace
+compliance or safety certification appropriate to flying multiple aircraft
+near people. Treat this as the algorithm layer to build on, not the
+finished product.

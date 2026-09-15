@@ -50,6 +50,17 @@ def main():
     print(f"  False confirmations:{result['false_confirmations']:>3}  (independent reports that agreed on empty space)")
     print(f"  Swarm connectivity: {result['swarm_connectivity_fraction'] * 100:.1f}% of steps fully connected")
     print(f"  Time elapsed:       {result['time_elapsed']:.1f}s")
+    print("\nPhase 2 sensing (see docs/PHASE2_SENSING.md):")
+    print(f"  Sensor detections:  {result['true_positive_detections']} true-positive, "
+          f"{result['false_positive_detections']} false-positive, {result['missed_detections']} missed "
+          f"(of {result['observation_opportunities']} observable opportunities)")
+    if result["mean_localization_error_m"] is not None:
+        print(f"  Mean localization error: {result['mean_localization_error_m']:.2f} m")
+    if result["mean_neighbor_observation_age_s"] is not None:
+        print(f"  Mean neighbor observation age: {result['mean_neighbor_observation_age_s']:.3f} s")
+    print(f"  Min sensor-observed neighbor clearance: {result['min_sensor_observed_clearance_m']} m")
+    print(f"  Min ground-truth neighbor clearance (scoring only): {result['min_ground_truth_clearance_m']} m")
+    print(f"  Steps with a PyBullet contact involving a drone: {result['contact_steps']}")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     result["telemetry"].save_csv(args.out)
