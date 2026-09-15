@@ -215,6 +215,7 @@ class WorldState:
     contract_version: str = CONTRACT_VERSION
 
     def __post_init__(self):
+        check_contract_version_compatible(self.contract_version, context="WorldState")
         _validate_nonnegative("sim_time_s", self.sim_time_s)
         _validate_nonneg_int("step_index", self.step_index)
         _validate_finite("dt_s", self.dt_s)
@@ -250,6 +251,7 @@ class VehicleState:
     contract_version: str = CONTRACT_VERSION
 
     def __post_init__(self):
+        check_contract_version_compatible(self.contract_version, context="VehicleState")
         _validate_nonempty_str("vehicle_id", self.vehicle_id)
         _validate_nonnegative("sim_time_s", self.sim_time_s)
         _validate_enum("frame", self.frame, Frame)
@@ -299,6 +301,7 @@ class SensorObservation:
     contract_version: str = CONTRACT_VERSION
 
     def __post_init__(self):
+        check_contract_version_compatible(self.contract_version, context="SensorObservation")
         _validate_nonempty_str("vehicle_id", self.vehicle_id)
         _validate_nonnegative("sensor_timestamp_s", self.sensor_timestamp_s)
         _validate_nonnegative("sensor_latency_s", self.sensor_latency_s)
@@ -338,6 +341,7 @@ class NeighborObservation:
     contract_version: str = CONTRACT_VERSION
 
     def __post_init__(self):
+        check_contract_version_compatible(self.contract_version, context="NeighborObservation")
         _validate_nonempty_str("receiver_id", self.receiver_id)
         _validate_nonempty_str("sender_id", self.sender_id)
         _require(self.receiver_id != self.sender_id, "receiver_id and sender_id must differ")
@@ -409,6 +413,7 @@ class Command:
     contract_version: str = CONTRACT_VERSION
 
     def __post_init__(self):
+        check_contract_version_compatible(self.contract_version, context="Command")
         _validate_nonempty_str("vehicle_id", self.vehicle_id)
         _validate_enum("command_type", self.command_type, CommandType)
         _validate_enum("frame", self.frame, Frame)
@@ -459,6 +464,7 @@ class SafetyDecision:
     contract_version: str = CONTRACT_VERSION
 
     def __post_init__(self):
+        check_contract_version_compatible(self.contract_version, context="SafetyDecision")
         _validate_nonempty_str("vehicle_id", self.vehicle_id)
         _validate_nonnegative("sim_time_s", self.sim_time_s)
         _require(isinstance(self.accepted, bool), "accepted must be a bool")

@@ -106,6 +106,7 @@ class RunManifest:
     def __post_init__(self):
         if not isinstance(self.contract_version, str) or not self.contract_version:
             raise ValueError("contract_version must be a non-empty str")
+        check_contract_version_compatible(self.contract_version, context="RunManifest")
         if not isinstance(self.config, dict):
             raise ValueError("config must be a dict")
         if not isinstance(self.master_seed, int) or isinstance(self.master_seed, bool):

@@ -234,7 +234,15 @@ utility (`manifest.hash_event_log`) is ready for that phase to call.
 
 ## Compatibility policy
 
-`from_dict` **enforces** this policy now, on every one of the six
+`check_contract_version_compatible()` enforces this policy on every one of
+the six contracts and on `RunManifest`, in **both** places a
+`contract_version` value can enter the system: `from_dict` (below) and
+each type's own `__post_init__`. Direct construction with an incompatible
+or malformed version — e.g. `Command(..., contract_version="99.0.0")` —
+fails immediately, the same as it would through deserialization; version
+checking isn't only a deserialization-path concern.
+
+`from_dict` **enforces** this policy too, on every one of the six
 contracts and on `RunManifest` — it is not just documentation:
 
 - For any type that carries a `contract_version` field, `from_dict`

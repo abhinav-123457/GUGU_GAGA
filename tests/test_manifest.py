@@ -170,3 +170,21 @@ def test_manifest_rejects_bool_master_seed():
             code_version="srchash:abc", python_version="3.12.0", dependency_versions={},
             map_id="m", model_id="cf2x",
         )
+
+
+def test_manifest_direct_construction_rejects_incompatible_major_version():
+    with pytest.raises(ValueError, match="incompatible contract_version"):
+        RunManifest(
+            contract_version="99.0.0", config={}, master_seed=1, subsystem_seeds={},
+            code_version="srchash:abc", python_version="3.12.0", dependency_versions={},
+            map_id="m", model_id="cf2x",
+        )
+
+
+def test_manifest_direct_construction_rejects_malformed_version_string():
+    with pytest.raises(ValueError, match="invalid contract version string"):
+        RunManifest(
+            contract_version="not-a-version", config={}, master_seed=1, subsystem_seeds={},
+            code_version="srchash:abc", python_version="3.12.0", dependency_versions={},
+            map_id="m", model_id="cf2x",
+        )

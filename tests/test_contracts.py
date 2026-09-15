@@ -525,3 +525,90 @@ def test_from_dict_missing_field_on_type_without_contract_version():
     del d["radius_m"]
     with pytest.raises(ValueError, match="radius_m"):
         c.from_dict(c.Obstacle, d)
+
+
+# ---------------------------------------------------------------------------
+# contract_version is validated on direct construction too, not only via
+# from_dict - a caller building one of these six by hand with an
+# incompatible or malformed version string must fail immediately.
+# ---------------------------------------------------------------------------
+
+def test_direct_construction_rejects_incompatible_major_version_world_state():
+    with pytest.raises(ValueError, match="incompatible contract_version"):
+        c.WorldState(
+            sim_time_s=0.0, step_index=0, dt_s=1.0 / 24.0, frame=c.Frame.LOCAL_ENU,
+            obstacles=(), geofence=_geofence(), victims_ground_truth=(),
+            contract_version="99.0.0",
+        )
+
+
+def test_direct_construction_rejects_incompatible_major_version_vehicle_state():
+    with pytest.raises(ValueError, match="incompatible contract_version"):
+        c.VehicleState(
+            vehicle_id="d0", sim_time_s=0.0, frame=c.Frame.LOCAL_ENU,
+            position_m=(0.0, 0.0, 0.0), velocity_mps=(0.0, 0.0, 0.0),
+            acceleration_mps2=(0.0, 0.0, 0.0), attitude_rad=(0.0, 0.0, 0.0),
+            angular_velocity_radps=(0.0, 0.0, 0.0), battery_fraction=1.0,
+            health_state=c.HealthState.OK, estimator_valid=True,
+            last_valid_command_time_s=None, contract_version="99.0.0",
+        )
+
+
+def test_direct_construction_rejects_incompatible_major_version_sensor_observation():
+    with pytest.raises(ValueError, match="incompatible contract_version"):
+        c.SensorObservation(
+            vehicle_id="d0", sensor_timestamp_s=0.0, sensor_latency_s=0.0, fov_deg=90.0,
+            range_returns_m=(), occluded=(), dropout=False, pose_uncertainty_m=0.0,
+            detections=(), contract_version="99.0.0",
+        )
+
+
+def test_direct_construction_rejects_incompatible_major_version_neighbor_observation():
+    with pytest.raises(ValueError, match="incompatible contract_version"):
+        c.NeighborObservation(
+            receiver_id="drone0", sender_id="drone1", frame=c.Frame.LOCAL_ENU,
+            measured_position_m=(0.0, 0.0, 0.0), measured_velocity_mps=(0.0, 0.0, 0.0),
+            sample_timestamp_s=0.0, delivery_timestamp_s=0.0, packet_age_s=0.0,
+            communication_confidence=0.5, stale=False, contract_version="99.0.0",
+        )
+
+
+def test_direct_construction_rejects_incompatible_major_version_command():
+    with pytest.raises(ValueError, match="incompatible contract_version"):
+        c.Command(
+            vehicle_id="d0", command_type=c.CommandType.VELOCITY_SETPOINT, frame=c.Frame.LOCAL_ENU,
+            desired_position_m=None, desired_velocity_mps=(0.0, 0.0, 0.0),
+            yaw_rad=None, yaw_rate_radps=None, timestamp_s=0.0, expiration_time_s=1.0,
+            source="x", confidence=0.5, contract_version="99.0.0",
+        )
+
+
+def test_direct_construction_rejects_incompatible_major_version_safety_decision():
+    with pytest.raises(ValueError, match="incompatible contract_version"):
+        c.SafetyDecision(
+            vehicle_id="d0", sim_time_s=0.0, accepted=False, filtered_command=None,
+            active_constraints=(), reason="x", emergency_state=c.SafetyState.NORMAL,
+            min_predicted_clearance_m=None, time_to_collision_s=None,
+            contract_version="99.0.0",
+        )
+
+
+def test_direct_construction_rejects_malformed_version_string():
+    with pytest.raises(ValueError, match="invalid contract version string"):
+        c.Command(
+            vehicle_id="d0", command_type=c.CommandType.VELOCITY_SETPOINT, frame=c.Frame.LOCAL_ENU,
+            desired_position_m=None, desired_velocity_mps=(0.0, 0.0, 0.0),
+            yaw_rad=None, yaw_rate_radps=None, timestamp_s=0.0, expiration_time_s=1.0,
+            source="x", confidence=0.5, contract_version="not-a-version",
+        )
+
+
+def test_direct_construction_accepts_same_major_different_minor_patch():
+    current_major = c.CONTRACT_VERSION.split(".")[0]
+    cmd = c.Command(
+        vehicle_id="d0", command_type=c.CommandType.VELOCITY_SETPOINT, frame=c.Frame.LOCAL_ENU,
+        desired_position_m=None, desired_velocity_mps=(0.0, 0.0, 0.0),
+        yaw_rad=None, yaw_rate_radps=None, timestamp_s=0.0, expiration_time_s=1.0,
+        source="x", confidence=0.5, contract_version=f"{current_major}.99.99",
+    )
+    assert cmd.contract_version == f"{current_major}.99.99"
