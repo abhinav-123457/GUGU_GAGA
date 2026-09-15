@@ -104,6 +104,13 @@ class VictimSensorModel:
         self.rng = rng
         self._delay = [deque() for _ in range(num_drones)]
         self._id_counter = 0
+        # Diagnostic-only counters (added for the Phase 2 diagnostic
+        # follow-up): pure bookkeeping, read nothing new, consume no RNG
+        # state, and do not affect any returned value - see
+        # docs/PHASE2_DIAGNOSTICS.md. Incremented in the same place every
+        # tick regardless of whether diagnostics are ever inspected.
+        self.diag_raw_candidates_generated = 0
+        self.diag_dropped_tick_count = 0
 
     def is_occluded(self, drone_xy, victim_xy) -> bool:
         """Pure ground-truth geometry, no RNG - safe to reuse from
@@ -177,8 +184,11 @@ class VictimSensorModel:
             )
             for xy, confidence in raw
         )
+        self.diag_raw_candidates_generated += len(candidates)  # diagnostic only, see __init__
 
         dropped = self.rng.random() < cfg.victim_sensor_dropout_prob
+        if dropped:
+            self.diag_dropped_tick_count += 1  # diagnostic only, see __init__
         payload = ((), True) if dropped else (candidates, False)
         self._delay[i].append(payload)
         if len(self._delay[i]) > cfg.victim_sensor_latency_steps:

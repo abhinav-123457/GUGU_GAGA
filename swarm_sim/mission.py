@@ -36,12 +36,18 @@ from . import sensors
 from .consensus import ConsensusBoard
 from .contracts import Frame, HealthState, SensorObservation, VehicleState
 from .controller import SwarmController
+from .diagnostics import MissionDiagnostics
 from .network import CommsNetwork
 from .recruitment import RecruitmentBoard
 from .seeding import SeedManager
 from .sensors import NeighborSensorModel, ObstacleRangeSensor, VictimSensorModel
 from .speed_control import SpeedController
 from .telemetry import TelemetryHub
+
+# CF2X body radius, for vehicle-body (edge-to-edge) clearance: arm length
+# (0.0397m) plus propeller radius (0.023135m), both printed by
+# BaseAviary's own startup log from the vendored URDF - not a guess.
+DRONE_BODY_RADIUS_M = 0.0397 + 0.023135
 
 # One distinct, high-contrast color per drone (cycles if num_drones > len(this)),
 # so an individual drone can be told apart at a glance instead of reading as
@@ -92,6 +98,8 @@ class FloodSearchMission:
         self._victim_bodies = []
         self._drone_label_ids = [-1] * config.num_drones
         self._drone_id_set = set(self.env.getDroneIds())
+        self._drone_body_id_to_index = {body_id: i for i, body_id in enumerate(self.env.getDroneIds())}
+        self._obstacle_body_ids = set()
 
         self.controller = SwarmController(config, config.num_drones, self.rng)
 
@@ -120,7 +128,16 @@ class FloodSearchMission:
         self._neighbor_obs_ages_s = []
         self._min_sensor_observed_clearance_m = math.inf
         self._min_ground_truth_clearance_m = math.inf
+        self._min_sensor_observed_obstacle_clearance_m = math.inf
+        self._min_ground_truth_obstacle_clearance_m = math.inf
         self._contact_steps = 0
+
+        # Phase 2 diagnostic follow-up (docs/PHASE2_DIAGNOSTICS.md): purely
+        # observational bookkeeping, added strictly for reporting - see
+        # swarm_sim/diagnostics.py's module docstring for what this is not.
+        self.diagnostics = MissionDiagnostics(
+            self.victims, config.consensus_quorum, config.consensus_cluster_radius,
+        )
 
         self._spawn_obstacles()
         if config.gui:
@@ -180,8 +197,9 @@ class FloodSearchMission:
             if self.cfg.gui:
                 vis = p.createVisualShape(p.GEOM_CYLINDER, radius=self.cfg.obstacle_radius, length=6.0,
                                            rgbaColor=[0.34, 0.28, 0.20, 1], physicsClientId=client)
-            p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
-                               basePosition=[ox, oy, 3.0], physicsClientId=client)
+            body_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+                                          basePosition=[ox, oy, 3.0], physicsClientId=client)
+            self._obstacle_body_ids.add(body_id)
 
     def _draw_victims(self):
         client = self.env.getPyBulletClient()
@@ -214,7 +232,13 @@ class FloodSearchMission:
         "observable" here means exactly what the sensor itself would have
         been able to see before its own noise/false-negative draw - this
         never changes what was already sensed or fed to consensus, it only
-        labels it after the fact."""
+        labels it after the fact.
+
+        Returns `matched_vids_for_candidates`, a list the same length and
+        order as `detections`, so the caller can attribute each
+        already-submitted consensus report to a victim (or None) for the
+        Phase 2 diagnostic report without this function recomputing or
+        re-triggering anything."""
         cfg = self.cfg
         # Floored so this doesn't degenerate to a zero-radius window (and
         # therefore reject even an exact, noise-free match) when
@@ -222,6 +246,7 @@ class FloodSearchMission:
         # scenario config.
         match_radius = max(cfg.victim_sensor_noise_std_m * 4, 0.25)
         matched_vids = set()
+        matched_vids_for_candidates = []
         for candidate in detections:
             cand_xy = np.array(candidate.position_m)
             best_vid, best_d = None, match_radius
@@ -229,18 +254,23 @@ class FloodSearchMission:
                 d = float(np.linalg.norm(victim_xy - cand_xy))
                 if d < best_d:
                     best_vid, best_d = vid, d
+            matched_vids_for_candidates.append(best_vid)
             if best_vid is not None:
                 self._true_positive_detections += 1
                 self._localization_errors.append(best_d)
                 matched_vids.add(best_vid)
+                self.diagnostics.record_detection_event(best_vid, best_d)
             else:
                 self._false_positive_detections += 1
+                self.diagnostics.record_detection_event(None, None)
 
         for vid, victim_xy in enumerate(self.victims):
-            if already_found_mask[vid]:
-                continue
             rel_xy = victim_xy - drone_xy
             horiz_dist = float(np.linalg.norm(rel_xy))
+            self.diagnostics.record_range_check(vid, horiz_dist <= cfg.victim_sensor_range_m)
+
+            if already_found_mask[vid]:
+                continue
             if horiz_dist > cfg.victim_sensor_range_m:
                 continue
             if sensors._horizontal_bearing(heading_xy, rel_xy) > math.radians(cfg.victim_sensor_hfov_deg) / 2:
@@ -250,6 +280,8 @@ class FloodSearchMission:
             self._observation_opportunities += 1
             if vid not in matched_vids:
                 self._missed_detections += 1
+
+        return matched_vids_for_candidates
 
     def _submit_detections(self, drone_id, detections, t):
         """Feed this drone's sensed victim-detection candidates (from
@@ -267,6 +299,12 @@ class FloodSearchMission:
         swarm itself only ever acts on the centroid via
         RecruitmentBoard.announce."""
         client = self.env.getPyBulletClient() if self.cfg.gui else None
+        # Snapshotted BEFORE try_confirm() runs, on purpose: try_confirm()
+        # consumes (removes) exactly the reports that reach quorum, so a
+        # snapshot taken after the loop would never see the cluster that
+        # just got confirmed - this is the state quorum was actually
+        # evaluated against.
+        self.diagnostics.record_consensus_report_snapshot(self.consensus.reports)
         result = self.consensus.try_confirm(t)
         while result is not None:
             centroid, drones = result
@@ -276,26 +314,109 @@ class FloodSearchMission:
                 self.board.announce(vid, [centroid[0], centroid[1], self.cfg.flight_altitude], min(drones), t)
                 if self.cfg.gui and vid < len(self._victim_bodies):
                     p.changeVisualShape(self._victim_bodies[vid], -1, rgbaColor=[0.25, 0.85, 0.55, 1], physicsClientId=client)
+                self.diagnostics.record_confirmation(vid, centroid, t, len(drones))
             else:
                 self.false_confirmations += 1
+                self.diagnostics.record_false_confirmation(len(drones))
             result = self.consensus.try_confirm(t)
 
-    def _track_clearance_and_contacts(self, i, positions, neighbor_obs):
-        """SCORING ONLY. Two deliberately separate metrics: what this
-        drone's own sensors believed (sensor-observed clearance - what a
-        future safety supervisor would actually have to work with) versus
-        ground truth (evaluation only, never fed back into any
-        decision)."""
+    def _track_clearance_and_contacts(self, i, positions, neighbor_obs, range_returns):
+        """SCORING ONLY. Several deliberately separate clearance metrics
+        (docs/PHASE2_DIAGNOSTICS.md has the full breakdown):
+        - center-to-center, estimated (from this drone's own sensed
+          neighbor positions) vs actual (ground truth)
+        - vehicle-body (edge-to-edge), derived from center-to-center minus
+          2x DRONE_BODY_RADIUS_M
+        - obstacle clearance (edge distance), estimated (sensed range
+          scan) vs actual (ground truth obstacle centers)
+        None of this is fed back into any decision - see
+        SwarmController.step(), which never receives ground truth or this
+        method's output."""
+        cfg = self.cfg
         if neighbor_obs:
-            sensed = min(
+            sensed_center = min(
                 float(np.linalg.norm(positions[i] - np.array(n.measured_position_m))) for n in neighbor_obs
             )
-            self._min_sensor_observed_clearance_m = min(self._min_sensor_observed_clearance_m, sensed)
+            self._min_sensor_observed_clearance_m = min(self._min_sensor_observed_clearance_m, sensed_center)
 
         true_dists = np.linalg.norm(positions - positions[i], axis=1)
         true_dists[i] = np.inf
-        if self.cfg.num_drones > 1:
+        if cfg.num_drones > 1:
             self._min_ground_truth_clearance_m = min(self._min_ground_truth_clearance_m, float(np.min(true_dists)))
+
+        finite_returns = [r for r in range_returns if math.isfinite(r)]
+        if finite_returns:
+            self._min_sensor_observed_obstacle_clearance_m = min(
+                self._min_sensor_observed_obstacle_clearance_m, min(finite_returns),
+            )
+        if len(self.obstacles) > 0:
+            true_obstacle_edge_dists = np.linalg.norm(self.obstacles - positions[i, :2], axis=1) - cfg.obstacle_radius
+            self._min_ground_truth_obstacle_clearance_m = min(
+                self._min_ground_truth_obstacle_clearance_m, float(np.min(true_obstacle_edge_dists)),
+            )
+
+    def _classify_and_log_contacts(self, t, positions, tick_neighbor_obs, tick_range_returns):
+        """SCORING/EVALUATION ONLY. Classifies every PyBullet-verified
+        physical contact this tick involving a drone, correlating it with
+        each involved drone's own sensing state at that same tick.
+
+        CRITICAL LIMITATION (see docs/PHASE2_DIAGNOSTICS.md): this is
+        evaluation instrumentation, not a safety mechanism. Nothing here
+        prevented, predicted, or reacted to any of these contacts - they
+        are logged strictly after the fact, for the report. Phase 4's
+        safety supervisor is the phase where a clearance estimate is
+        actually allowed to change a command."""
+        client = self.env.getPyBulletClient()
+        contacts = p.getContactPoints(physicsClientId=client)
+        relevant = [c for c in contacts if c[1] in self._drone_id_set or c[2] in self._drone_id_set]
+        if relevant:
+            self._contact_steps += 1
+
+        for c in relevant:
+            body_a, body_b = c[1], c[2]
+            drone_ids_involved = [idx for body in (body_a, body_b)
+                                   for idx in ([self._drone_body_id_to_index[body]]
+                                               if body in self._drone_body_id_to_index else [])]
+
+            estimated_clearance_m = None
+            actual_clearance_m = None
+            sensor_age_s = None
+            stale_or_dropout = True
+
+            if body_a in self._drone_id_set and body_b in self._drone_id_set:
+                a, b = self._drone_body_id_to_index[body_a], self._drone_body_id_to_index[body_b]
+                actual_clearance_m = float(np.linalg.norm(positions[a] - positions[b]))
+                for observer, other in ((a, b), (b, a)):
+                    match = next((n for n in tick_neighbor_obs.get(observer, ())
+                                  if n.sender_id == f"drone{other}"), None)
+                    if match is not None:
+                        estimated_clearance_m = float(np.linalg.norm(
+                            positions[observer] - np.array(match.measured_position_m)))
+                        sensor_age_s = match.packet_age_s
+                        stale_or_dropout = match.stale
+                        break
+            elif body_a in self._drone_id_set or body_b in self._drone_id_set:
+                drone_idx = drone_ids_involved[0]
+                if body_a in self._obstacle_body_ids or body_b in self._obstacle_body_ids:
+                    obstacle_body = body_a if body_a in self._obstacle_body_ids else body_b
+                    obstacle_pos = np.array(p.getBasePositionAndOrientation(obstacle_body, physicsClientId=client)[0][:2])
+                    actual_clearance_m = float(np.linalg.norm(positions[drone_idx, :2] - obstacle_pos)) - self.cfg.obstacle_radius
+                    finite_returns = [r for r in tick_range_returns.get(drone_idx, ()) if math.isfinite(r)]
+                    estimated_clearance_m = min(finite_returns) if finite_returns else None
+                    stale_or_dropout = estimated_clearance_m is None
+                else:
+                    actual_clearance_m = float(positions[drone_idx, 2])  # height above the ground plane
+                    estimated_clearance_m = None  # no downward/ground sensor modeled - see limitation
+
+            pair_key = (min(body_a, body_b), max(body_a, body_b))
+            self.diagnostics.classify_contact(
+                t=t, body_a=body_a, body_b=body_b, drone_id_set=self._drone_id_set,
+                obstacle_body_ids=self._obstacle_body_ids,
+                estimated_clearance_m=estimated_clearance_m, actual_clearance_m=actual_clearance_m,
+                sensor_age_s=sensor_age_s, command_age_s=sensor_age_s,  # proxy - see docs/PHASE2_DIAGNOSTICS.md
+                observation_dropout_or_stale=stale_or_dropout,
+                drone_ids_involved=drone_ids_involved, pair_key=pair_key,
+            )
 
     def _update_drone_labels(self, positions):
         """Floating 'D{i}' label above each drone, updated in place each step
@@ -343,12 +464,9 @@ class FloodSearchMission:
             self._connected_steps += int(len(comp_sizes) == 1)
             self._connectivity_checks += 1
 
-            client = self.env.getPyBulletClient()
-            if any(c[1] in self._drone_id_set or c[2] in self._drone_id_set
-                   for c in p.getContactPoints(physicsClientId=client)):
-                self._contact_steps += 1
-
             already_found_mask = [vid in self.victims_found for vid in range(cfg.num_victims)]
+            tick_neighbor_obs = {}
+            tick_range_returns = {}
 
             for i in range(cfg.num_drones):
                 heading_xy = self.controller.headings[i][:2].copy()
@@ -364,6 +482,7 @@ class FloodSearchMission:
                     estimator_valid=True, last_valid_command_time_s=t,
                 )
 
+                sensing_t0 = timemod.perf_counter()
                 detections, dropped = self.victim_sensor.sense(
                     i, positions[i], heading_xy, t, already_found_mask,
                 )
@@ -379,12 +498,21 @@ class FloodSearchMission:
                     detections=detections,
                 )
                 neighbor_obs = self.neighbor_sensor.observations_for(i, dt)
+                self.diagnostics.sensing_cpu_time_s += timemod.perf_counter() - sensing_t0
+                tick_neighbor_obs[i] = neighbor_obs
+                tick_range_returns[i] = range_returns
 
-                self._classify_detections_for_scoring(positions[i, :2], heading_xy, detections, already_found_mask)
+                matched_vids_for_candidates = self._classify_detections_for_scoring(
+                    positions[i, :2], heading_xy, detections, already_found_mask,
+                )
+                consensus_t0 = timemod.perf_counter()
                 self._submit_detections(i, detections, t)
+                self.diagnostics.consensus_cpu_time_s += timemod.perf_counter() - consensus_t0
+                for matched_vid in matched_vids_for_candidates:
+                    self.diagnostics.record_submission(matched_vid)
                 self._detection_latencies_s.extend([sensor_obs.sensor_latency_s] * len(detections))
                 self._neighbor_obs_ages_s.extend(n.packet_age_s for n in neighbor_obs)
-                self._track_clearance_and_contacts(i, positions, neighbor_obs)
+                self._track_clearance_and_contacts(i, positions, neighbor_obs, range_returns)
 
                 desired_vel = self.controller.step(
                     i, own_state, sensor_obs, neighbor_obs, self.board, self.network,
@@ -410,7 +538,11 @@ class FloodSearchMission:
                                        float(np.linalg.norm(velocities[i])), mode, applied_speed,
                                        num_neighbors)
 
+            consensus_t0 = timemod.perf_counter()
             self._resolve_confirmed_detections(t)
+            self.diagnostics.consensus_cpu_time_s += timemod.perf_counter() - consensus_t0
+
+            self._classify_and_log_contacts(t, positions, tick_neighbor_obs, tick_range_returns)
 
             if cfg.gui:
                 if step % 4 == 0:  # a few times a second is plenty legible, and far gentler on the debug renderer
@@ -421,12 +553,17 @@ class FloodSearchMission:
                 break
 
         self.env.close()
+        self.diagnostics.finalize()
         connectivity_fraction = (self._connected_steps / self._connectivity_checks
                                   if self._connectivity_checks else 1.0)
         mean_localization_error = (float(np.mean(self._localization_errors))
                                     if self._localization_errors else None)
         mean_neighbor_obs_age = (float(np.mean(self._neighbor_obs_ages_s))
                                   if self._neighbor_obs_ages_s else None)
+
+        def _finite_or_none(x):
+            return None if math.isinf(x) else x
+
         return {
             "victims_found": len(self.victims_found),
             "total_victims": cfg.num_victims,
@@ -441,11 +578,29 @@ class FloodSearchMission:
             "observation_opportunities": self._observation_opportunities,
             "mean_localization_error_m": mean_localization_error,
             "mean_neighbor_observation_age_s": mean_neighbor_obs_age,
-            "min_sensor_observed_clearance_m": (
-                None if math.isinf(self._min_sensor_observed_clearance_m) else self._min_sensor_observed_clearance_m
+            "min_sensor_observed_clearance_m": _finite_or_none(self._min_sensor_observed_clearance_m),
+            "min_ground_truth_clearance_m": _finite_or_none(self._min_ground_truth_clearance_m),
+            "vehicle_body_radius_m": DRONE_BODY_RADIUS_M,
+            "min_vehicle_body_clearance_m": (
+                None if math.isinf(self._min_ground_truth_clearance_m)
+                else self._min_ground_truth_clearance_m - 2 * DRONE_BODY_RADIUS_M
             ),
-            "min_ground_truth_clearance_m": (
-                None if math.isinf(self._min_ground_truth_clearance_m) else self._min_ground_truth_clearance_m
-            ),
+            "min_sensor_observed_obstacle_clearance_m": _finite_or_none(self._min_sensor_observed_obstacle_clearance_m),
+            "min_ground_truth_obstacle_clearance_m": _finite_or_none(self._min_ground_truth_obstacle_clearance_m),
+            "neighbor_sensor_uncertainty_margin_m": cfg.neighbor_sensor_noise_std_m,
             "contact_steps": self._contact_steps,
+            # Phase 2 diagnostic follow-up - see docs/PHASE2_DIAGNOSTICS.md
+            "diagnostics": self.diagnostics.to_report_dict(),
+            "sensor_raw_candidate_count": self.victim_sensor.diag_raw_candidates_generated,
+            "sensor_dropped_tick_count": self.victim_sensor.diag_dropped_tick_count,
+            # Approximate - see docs/PHASE2_DIAGNOSTICS.md's "expired candidate
+            # count" note. total_submitted - consumed_by_confirmations -
+            # still_pending_at_end = expired mid-run without ever confirming.
+            "consensus_candidate_count": self._true_positive_detections + self._false_positive_detections,
+            "consensus_expired_candidate_count_approx": (
+                (self._true_positive_detections + self._false_positive_detections)
+                - self.diagnostics.reports_consumed_by_confirmations
+                - len(self.consensus.reports)
+            ),
+            "consensus_final_pending_report_count": len(self.consensus.reports),
         }
