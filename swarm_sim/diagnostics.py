@@ -90,6 +90,27 @@ class MissionDiagnostics:
         self.reports_consumed_by_confirmations = 0
         self.contact_log: List[ContactEvent] = []
         self._prev_actual_clearance: Dict[Tuple[int, int], float] = {}
+        # Contact accounting - see docs/PHASE2_DIAGNOSTICS.md's "raw vs.
+        # deduplicated vs. step" reconciliation. Each is a genuinely
+        # different count of the same underlying PyBullet contact stream:
+        #   raw_contact_point_count      - every getContactPoints() record
+        #                                  involving a drone, summed over all
+        #                                  ticks (PyBullet may report several
+        #                                  manifold points for one touching
+        #                                  pair in a single tick)
+        #   len(contact_log)             - deduplicated_contact_event_count:
+        #                                  one entry per distinct (tick,
+        #                                  body-pair), set by the caller
+        #                                  collapsing raw records before
+        #                                  calling classify_contact
+        #   contact_step_count           - ticks with >=1 relevant contact
+        #                                  (sets to mission.py's own
+        #                                  _contact_steps counter, unchanged)
+        self.raw_contact_point_count = 0
+        self.contact_step_count = 0
+        self.drone_drone_contact_count = 0
+        self.drone_obstacle_contact_count = 0
+        self.drone_ground_contact_count = 0
 
     # -- victim detection ---------------------------------------------
 
@@ -180,6 +201,13 @@ class MissionDiagnostics:
         else:
             category = "drone_ground"
 
+        if category == "drone_drone":
+            self.drone_drone_contact_count += 1
+        elif category == "drone_obstacle":
+            self.drone_obstacle_contact_count += 1
+        else:
+            self.drone_ground_contact_count += 1
+
         prev_actual = self._prev_actual_clearance.get(pair_key)
         if prev_actual is None or actual_clearance_m is None:
             trend = "unknown"
@@ -218,4 +246,12 @@ class MissionDiagnostics:
             "sensing_cpu_time_s": self.sensing_cpu_time_s,
             "consensus_cpu_time_s": self.consensus_cpu_time_s,
             "contact_log": [c.to_dict() for c in self.contact_log],
+            # Contact accounting, disambiguated - see the __init__ comment
+            # above and docs/PHASE2_DIAGNOSTICS.md for what each counts.
+            "raw_contact_point_count": self.raw_contact_point_count,
+            "deduplicated_contact_event_count": len(self.contact_log),
+            "contact_step_count": self.contact_step_count,
+            "drone_obstacle_contact_count": self.drone_obstacle_contact_count,
+            "drone_drone_contact_count": self.drone_drone_contact_count,
+            "drone_ground_contact_count": self.drone_ground_contact_count,
         }

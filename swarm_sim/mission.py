@@ -59,6 +59,23 @@ DRONE_COLORS = [
 ]
 
 
+def _dedupe_contacts_by_pair(contacts):
+    """Collapse PyBullet's possibly-several contact-point records for the
+    same touching pair of bodies within one tick (one manifold point each,
+    same physical event) down to one representative record per (body_a,
+    body_b) pair. `contacts` is a `getContactPoints()`-shaped list (or any
+    subset of it): tuples whose index 1 and 2 are the two body unique ids.
+    Pure/stateless - does not affect physics or what PyBullet reports, only
+    how many diagnostic events they log as. See docs/PHASE2_DIAGNOSTICS.md's
+    raw-vs-deduplicated contact-count reconciliation. Returns a dict keyed
+    by the sorted (body_a, body_b) pair, in first-seen order."""
+    seen = {}
+    for c in contacts:
+        pair_key = (min(c[1], c[2]), max(c[1], c[2]))
+        seen.setdefault(pair_key, c)
+    return seen
+
+
 class FloodSearchMission:
     def __init__(self, config):
         self.cfg = config
@@ -371,8 +388,14 @@ class FloodSearchMission:
         relevant = [c for c in contacts if c[1] in self._drone_id_set or c[2] in self._drone_id_set]
         if relevant:
             self._contact_steps += 1
+        # raw_contact_point_count: every getContactPoints() record touching
+        # a drone, summed over the whole run - PyBullet can report several
+        # manifold points for the SAME touching pair within one tick, which
+        # is why this is larger than the deduplicated event count below.
+        # See docs/PHASE2_DIAGNOSTICS.md's raw-vs-deduplicated reconciliation.
+        self.diagnostics.raw_contact_point_count += len(relevant)
 
-        for c in relevant:
+        for pair_key, c in _dedupe_contacts_by_pair(relevant).items():
             body_a, body_b = c[1], c[2]
             drone_ids_involved = [idx for body in (body_a, body_b)
                                    for idx in ([self._drone_body_id_to_index[body]]
@@ -408,7 +431,6 @@ class FloodSearchMission:
                     actual_clearance_m = float(positions[drone_idx, 2])  # height above the ground plane
                     estimated_clearance_m = None  # no downward/ground sensor modeled - see limitation
 
-            pair_key = (min(body_a, body_b), max(body_a, body_b))
             self.diagnostics.classify_contact(
                 t=t, body_a=body_a, body_b=body_b, drone_id_set=self._drone_id_set,
                 obstacle_body_ids=self._obstacle_body_ids,
@@ -553,6 +575,7 @@ class FloodSearchMission:
                 break
 
         self.env.close()
+        self.diagnostics.contact_step_count = self._contact_steps
         self.diagnostics.finalize()
         connectivity_fraction = (self._connected_steps / self._connectivity_checks
                                   if self._connectivity_checks else 1.0)
