@@ -12,9 +12,10 @@ Each paper you asked for maps to a specific, runnable piece of the system:
 
 | Paper | Role in this system |
 |---|---|
-| Reynolds (1987), *Flocks, herds and schools* | `swarm_sim/behaviors/boids.py` - separation/alignment/cohesion, one of three selectable flocking models |
-| Vicsek et al. (1995) | `swarm_sim/behaviors/vicsek.py` - noisy heading-averaging, a lighter-weight alternative flocking model |
+| Reynolds (1987), *Flocks, herds and schools* | `swarm_sim/behaviors/boids.py` - separation/alignment/cohesion, one of four selectable flocking models |
+| Vicsek et al. (1995) | `swarm_sim/behaviors/vicsek.py` - the canonical heading-averaging model (atan2 circular mean + angular noise), a lighter-weight alternative flocking model |
 | Couzin et al. (2002), *Collective memory and spatial sorting* | `swarm_sim/behaviors/couzin.py` - zonal repulsion/orientation/attraction with a field of view; the default flocking model |
+| Olfati-Saber (2006), *Flocking for multi-agent dynamic systems* | `swarm_sim/behaviors/olfati_saber.py` - sigma-norm spacing potential + velocity consensus + navigation feedback; see docs/PHASE3_BEHAVIORS.md for which parts are from the paper and which are engineering approximations |
 | Bonabeau et al. (1996), self-organization in social insects | `swarm_sim/recruitment.py` - the recruitment signal decays like a stigmergic trace rather than broadcasting forever |
 | Viswanathan et al. (1999), Levy-flight foraging | `swarm_sim/behaviors/levy_flight.py` - heavy-tailed step lengths for area search, proven near-optimal for sparse random targets |
 | von Frisch (1967), bee waggle-dance | `swarm_sim/recruitment.py` - a drone that finds a victim recruits a bounded number of nearby swarm-mates to it |
@@ -24,7 +25,7 @@ Each paper you asked for maps to a specific, runnable piece of the system:
 ```
 swarm_sim/
   config.py        MissionConfig - every tunable parameter, one place
-  behaviors/        boids.py, vicsek.py, couzin.py, levy_flight.py (pure functions, one per paper)
+  behaviors/        boids.py, vicsek.py, couzin.py, olfati_saber.py, levy_flight.py (pure functions, one per paper)
   network.py        CommsNetwork - simulated UAV<->UAV radio: range, packet loss, latency
   sensors.py        VictimSensorModel / ObstacleRangeSensor / NeighborSensorModel -
                      the only place ground truth is read to produce noisy/range-limited

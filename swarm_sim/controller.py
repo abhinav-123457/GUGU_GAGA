@@ -16,7 +16,7 @@ import math
 import numpy as np
 
 from . import sensors
-from .behaviors import boids, vicsek, couzin, levy_flight
+from .behaviors import boids, vicsek, couzin, levy_flight, olfati_saber
 
 
 class SwarmController:
@@ -187,6 +187,22 @@ class SwarmController:
                 flock_vec = boids.boids_steer(local_pos, local_vel, 0, perceived_ids, cfg.r_attraction)
             elif cfg.flock_model == "vicsek":
                 flock_vec = vicsek.vicsek_heading(local_head, 0, perceived_ids, cfg.vicsek_noise, self.rng)
+            elif cfg.flock_model == "olfati_saber":
+                # Engineering approximation (see behaviors/olfati_saber.py):
+                # no dedicated virtual-leader agent exists in this
+                # simulator, so the navigation term's target is just this
+                # drone's own position (no positional pull) with a target
+                # velocity along the current search heading - the term
+                # degrades to "match the search direction" rather than
+                # "track a leader's trajectory".
+                neighbor_pos = local_pos[1:]
+                neighbor_vel = local_vel[1:]
+                flock_vec = olfati_saber.olfati_saber_steer(
+                    local_pos[0], local_vel[0], neighbor_pos, neighbor_vel,
+                    target_pos=local_pos[0], target_vel=self.headings[i] * cfg.cruise_speed_mps,
+                    d_alpha=cfg.os_desired_spacing_m, r_alpha=cfg.os_interaction_range_m,
+                    c_spacing=cfg.os_c_spacing, c_align=cfg.os_c_align, c_nav=cfg.os_c_nav,
+                )
             else:
                 flock_vec = couzin.couzin_direction(
                     local_pos, local_head, 0, perceived_ids,

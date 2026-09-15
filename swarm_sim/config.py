@@ -21,8 +21,23 @@ class MissionConfig:
     r_orientation: float = 4.0
     r_attraction: float = 6.0
     fov_deg: float = 270.0
-    flock_model: str = "couzin"     # "couzin" | "boids" | "vicsek"
-    vicsek_noise: float = 0.15
+    flock_model: str = "couzin"     # "couzin" | "boids" | "vicsek" | "olfati_saber"
+    vicsek_noise: float = 0.15      # uniform angular noise half-width, radians (Phase 3 - see behaviors/vicsek.py)
+    max_turn_rate_radps: float = 3.0   # bounded-turn-rate half of the Phase 3 common controller
+                                        # contract (swarm_sim/behaviors/common.py); used by the
+                                        # standalone *_candidate_command entry points - the blended
+                                        # search pipeline below already rate-limits via max_accel_mps2/
+                                        # emergency_accel_mps2 on the resulting velocity instead.
+
+    # Olfati-Saber-inspired controller (Phase 3 - see behaviors/olfati_saber.py
+    # for which parts are from Olfati-Saber (2006) and which are engineering
+    # approximations). d_alpha/r_alpha are in the same meters used elsewhere;
+    # the module converts to sigma-norm units internally.
+    os_desired_spacing_m: float = 4.0
+    os_interaction_range_m: float = 6.0
+    os_c_spacing: float = 1.0
+    os_c_align: float = 1.0
+    os_c_nav: float = 1.0
 
     # Levy-flight search bias (Viswanathan et al. 1999)
     levy_alpha: float = 1.5
