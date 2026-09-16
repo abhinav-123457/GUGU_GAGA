@@ -96,3 +96,37 @@ class CommsNetwork:
             seen |= comp
             sizes.append(len(comp))
         return sizes
+
+    def component_size_per_drone(self, max_age_steps):
+        """Same connectivity graph as connected_component_sizes, but
+        returned as one size per drone index (size of THAT drone's own
+        component) rather than one entry per component - added for Phase
+        4's safety supervisor, which needs to know whether a specific
+        vehicle is currently isolated (its own component size == 1), not
+        just the overall size distribution. Pure read of the same
+        already-comms-realistic last_seen data; changes nothing about
+        connected_component_sizes' own behavior."""
+        cur = self.step
+        adj = {i: set() for i in range(self.n)}
+        for i in range(self.n):
+            for j, e in self.last_seen[i].items():
+                if cur - e["step"] <= max_age_steps:
+                    adj[i].add(j)
+                    adj[j].add(i)
+
+        sizes = [0] * self.n
+        seen = set()
+        for start in range(self.n):
+            if start in seen:
+                continue
+            stack, comp = [start], set()
+            while stack:
+                node = stack.pop()
+                if node in comp:
+                    continue
+                comp.add(node)
+                stack.extend(adj[node] - comp)
+            seen |= comp
+            for node in comp:
+                sizes[node] = len(comp)
+        return sizes

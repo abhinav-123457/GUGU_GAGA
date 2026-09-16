@@ -121,6 +121,38 @@ class MissionConfig:
     repulsion_speed_mps: float = 1.0    # avoidance slows down rather than swerving at full cruise speed -
                                          # keeps velocity-tracking error (and thus commanded tilt) small
 
+    # Phase 4: independent safety supervisor (swarm_sim/safety_supervisor.py).
+    # Deliberately a separate set of bounds/margins from the flocking config
+    # above (max_speed_mps/max_accel_mps2 etc.) - see
+    # docs/PHASE4_SAFETY.md's "independence" note. safety_enabled exists
+    # only so tests/benchmarks can compare the same scenario with/without
+    # the supervisor in the loop (e.g. to reproduce the Phase 2 wedging
+    # failure on purpose); it defaults to on.
+    safety_enabled: bool = True
+    safety_max_speed_mps: float = 5.0
+    safety_max_accel_mps2: float = 4.0
+    safety_max_turn_rate_radps: float = 3.0
+    safety_command_latency_s: float = 0.15
+    safety_assumed_brake_decel_mps2: float = 3.0
+    safety_separation_hard_margin_m: float = 0.3
+    safety_separation_uncertainty_inflation_m: float = 0.5
+    safety_obstacle_hard_margin_m: float = 0.3
+    safety_obstacle_uncertainty_inflation_m: float = 1.0
+    safety_stuck_window_s: float = 2.0
+    safety_stuck_min_progress_m: float = 0.3
+    safety_stuck_near_obstacle_m: float = 1.0
+    safety_stuck_violation_streak: int = 3
+    safety_escape_duration_s: float = 3.0
+    safety_escape_speed_mps: float = 2.0
+    safety_geofence_margin_m: float = 2.0
+    safety_altitude_floor_m: float = 0.5
+    safety_altitude_ceiling_m: float = 8.0
+    safety_altitude_margin_m: float = 0.5
+    safety_battery_reserve_fraction: float = 0.2
+    safety_battery_critical_fraction: float = 0.08
+    safety_link_timeout_s: float = 1.0
+    safety_lost_agent_timeout_s: float = 5.0
+
     # Simulation
     duration_sec: float = 90.0
     control_freq_hz: int = 24

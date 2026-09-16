@@ -34,11 +34,14 @@ from gym_pybullet_drones.utils.utils import sync
 
 from . import sensors
 from .consensus import ConsensusBoard
-from .contracts import Frame, HealthState, SensorObservation, VehicleState
+from .contracts import CommandType, Frame, GeofenceSpec, HealthState, SensorObservation, VehicleState
 from .controller import SwarmController
 from .diagnostics import MissionDiagnostics
 from .network import CommsNetwork
 from .recruitment import RecruitmentBoard
+from .safety_supervisor import (
+    CandidateCommand, MissionContext, SafetySupervisor, SafetySupervisorConfig,
+)
 from .seeding import SeedManager
 from .sensors import NeighborSensorModel, ObstacleRangeSensor, VictimSensorModel
 from .speed_control import SpeedController
@@ -119,6 +122,45 @@ class FloodSearchMission:
         self._obstacle_body_ids = set()
 
         self.controller = SwarmController(config, config.num_drones, self.rng)
+
+        # Phase 4: independent safety supervisor - see
+        # swarm_sim/safety_supervisor.py and docs/PHASE4_SAFETY.md. Its own
+        # config is deliberately separate from the flocking config above.
+        self.safety = SafetySupervisor(SafetySupervisorConfig(
+            max_speed_mps=config.safety_max_speed_mps,
+            max_accel_mps2=config.safety_max_accel_mps2,
+            max_turn_rate_radps=config.safety_max_turn_rate_radps,
+            command_latency_s=config.safety_command_latency_s,
+            assumed_brake_decel_mps2=config.safety_assumed_brake_decel_mps2,
+            vehicle_body_radius_m=DRONE_BODY_RADIUS_M,
+            separation_hard_margin_m=config.safety_separation_hard_margin_m,
+            separation_uncertainty_inflation_m=config.safety_separation_uncertainty_inflation_m,
+            obstacle_hard_margin_m=config.safety_obstacle_hard_margin_m,
+            obstacle_uncertainty_inflation_m=config.safety_obstacle_uncertainty_inflation_m,
+            stuck_window_s=config.safety_stuck_window_s,
+            stuck_min_progress_m=config.safety_stuck_min_progress_m,
+            stuck_near_obstacle_m=config.safety_stuck_near_obstacle_m,
+            stuck_violation_streak=config.safety_stuck_violation_streak,
+            escape_duration_s=config.safety_escape_duration_s,
+            escape_speed_mps=config.safety_escape_speed_mps,
+            geofence_margin_m=config.safety_geofence_margin_m,
+            altitude_margin_m=config.safety_altitude_margin_m,
+            battery_reserve_fraction=config.safety_battery_reserve_fraction,
+            battery_critical_fraction=config.safety_battery_critical_fraction,
+            link_timeout_s=config.safety_link_timeout_s,
+            lost_agent_timeout_s=config.safety_lost_agent_timeout_s,
+        ))
+        self._geofence = GeofenceSpec(
+            frame=Frame.LOCAL_ENU, center_m=(0.0, 0.0), half_extents_m=(half, half),
+            floor_alt_m=config.safety_altitude_floor_m, ceiling_alt_m=config.safety_altitude_ceiling_m,
+        )
+        self.operator_abort = False   # tests/scenarios may set this directly to model an operator-triggered abort
+        self._safety_candidate_count = 0
+        self._safety_accepted_count = 0
+        self._safety_rejected_count = 0
+        self._safety_override_count = 0
+        self._safety_state_counts = {}
+        self._safety_cpu_time_s = 0.0
 
         # Phase 2 sensing: three independent RNG streams (never one shared
         # stream - see docs/PHASE2_SENSING.md), scoped just to sensing so
@@ -372,6 +414,20 @@ class FloodSearchMission:
                 self._min_ground_truth_obstacle_clearance_m, float(np.min(true_obstacle_edge_dists)),
             )
 
+    def _drone_has_contact_now(self, i: int) -> bool:
+        """Evaluation-only input to the Phase 4 safety supervisor: is
+        drone i touching anything (another drone, an obstacle, the
+        ground) RIGHT NOW, per PyBullet's own physics this tick - not
+        victim ground truth. Queried via its own (cheap, bodyA/bodyB-
+        filtered) getContactPoints() call, deliberately separate from
+        _classify_and_log_contacts below so Phase 2's diagnostic contact
+        accounting is untouched by Phase 4 - see docs/PHASE4_SAFETY.md."""
+        client = self.env.getPyBulletClient()
+        body_id = self.env.getDroneIds()[i]
+        if p.getContactPoints(bodyA=body_id, physicsClientId=client):
+            return True
+        return bool(p.getContactPoints(bodyB=body_id, physicsClientId=client))
+
     def _classify_and_log_contacts(self, t, positions, tick_neighbor_obs, tick_range_returns):
         """SCORING/EVALUATION ONLY. Classifies every PyBullet-verified
         physical contact this tick involving a drone, correlating it with
@@ -485,6 +541,10 @@ class FloodSearchMission:
             comp_sizes = self.network.connected_component_sizes(cfg.comm_max_age_steps)
             self._connected_steps += int(len(comp_sizes) == 1)
             self._connectivity_checks += 1
+            # Phase 4: per-drone isolation, for MissionContext.own_agent_isolated
+            # (LOST_AGENT) - same already-comms-realistic network data as
+            # swarm_connectivity_fraction above, just broken out per drone.
+            per_drone_component_size = self.network.component_size_per_drone(cfg.comm_max_age_steps)
 
             already_found_mask = [vid in self.victims_found for vid in range(cfg.num_victims)]
             tick_neighbor_obs = {}
@@ -540,13 +600,63 @@ class FloodSearchMission:
                     i, own_state, sensor_obs, neighbor_obs, self.board, self.network,
                 )
 
-                target_vel, applied_speed = self.speed_ctrl.to_velocity_command(i, desired_vel)
+                safe_vel = desired_vel
+                if cfg.safety_enabled:
+                    candidate = CandidateCommand(
+                        vehicle_id=f"drone{i}", desired_velocity_mps=tuple(float(v) for v in desired_vel),
+                        frame=Frame.LOCAL_ENU, timestamp_s=t, expiration_time_s=t + 4 * dt,
+                        source="SwarmController",
+                    )
+                    mission_context = MissionContext(
+                        geofence=self._geofence, operator_abort=self.operator_abort,
+                        contact_detected=self._drone_has_contact_now(i),
+                        own_agent_isolated=(cfg.num_drones > 1 and per_drone_component_size[i] == 1),
+                    )
+                    safety_t0 = timemod.perf_counter()
+                    decision = self.safety.evaluate(candidate, own_state, sensor_obs, neighbor_obs,
+                                                       mission_context, now_s=t)
+                    self._safety_cpu_time_s += timemod.perf_counter() - safety_t0
+
+                    self._safety_candidate_count += 1
+                    state_name = decision.emergency_state.value
+                    self._safety_state_counts[state_name] = self._safety_state_counts.get(state_name, 0) + 1
+                    if decision.accepted:
+                        self._safety_accepted_count += 1
+                        if decision.active_constraints and decision.active_constraints != ("sensor_dropout",):
+                            self._safety_override_count += 1
+                        cmd = decision.filtered_command
+                        if cmd.command_type == CommandType.VELOCITY_SETPOINT:
+                            safe_vel = np.array(cmd.desired_velocity_mps)
+                        else:
+                            # HOLD / LAND / ABORT: no setpoint fields (see
+                            # contracts.Command's _COMMAND_TYPE_RULES) - the
+                            # conservative default of holding horizontal
+                            # position is the only one of these three this
+                            # sim's PID loop (which has no motor-cutoff or
+                            # descent-rate concept - see docs/PHASE4_SAFETY.md's
+                            # "Assumptions") can actually realize.
+                            safe_vel = np.zeros(3)
+                    else:
+                        self._safety_rejected_count += 1
+                        safe_vel = np.zeros(3)
+
+                target_vel, applied_speed = self.speed_ctrl.to_velocity_command(i, safe_vel)
                 # Anchor altitude via real position feedback (z held at flight_altitude);
                 # x/y are left to pure velocity tracking so the swarm behavior drives motion.
                 # Yaw is held at a fixed setpoint (0) rather than "current yaw" - the latter
                 # gives zero yaw error every step, i.e. no restoring torque, which lets any
                 # residual spin (excited by continuously-curving swarm paths) run away freely.
-                target_pos = np.array([positions[i, 0], positions[i, 1], cfg.flight_altitude])
+                # Altitude is otherwise held at a fixed cruise setpoint (see
+                # comment above) - the one exception is a nonzero z from the
+                # safety supervisor's own filtered command (altitude floor/
+                # ceiling correction, see safety_supervisor.py's
+                # _evaluate_altitude), integrated one step and clamped
+                # inside the geofence's floor/ceiling.
+                target_z = cfg.flight_altitude
+                if cfg.safety_enabled and abs(safe_vel[2]) > 1e-9:
+                    target_z = float(np.clip(positions[i, 2] + safe_vel[2] * dt,
+                                              self._geofence.floor_alt_m, self._geofence.ceiling_alt_m))
+                target_pos = np.array([positions[i, 0], positions[i, 1], target_z])
                 rpm_action[i], _, _ = self.pid[i].computeControlFromState(
                     control_timestep=self.env.CTRL_TIMESTEP,
                     state=obs[i],
@@ -626,4 +736,13 @@ class FloodSearchMission:
                 - len(self.consensus.reports)
             ),
             "consensus_final_pending_report_count": len(self.consensus.reports),
+            # Phase 4 safety supervisor - see docs/PHASE4_SAFETY.md.
+            "safety_enabled": cfg.safety_enabled,
+            "safety_candidate_count": self._safety_candidate_count,
+            "safety_accepted_count": self._safety_accepted_count,
+            "safety_rejected_count": self._safety_rejected_count,
+            "safety_override_count": self._safety_override_count,
+            "safety_state_counts": dict(self._safety_state_counts),
+            "safety_cpu_time_s": self._safety_cpu_time_s,
+            "safety_event_log": [e.to_dict() for e in self.safety.event_log],
         }

@@ -31,7 +31,7 @@ import math
 from enum import Enum
 from typing import Optional, Tuple
 
-CONTRACT_VERSION = "0.1.0"
+CONTRACT_VERSION = "0.2.0"
 
 Vec2 = Tuple[float, float]
 Vec3 = Tuple[float, float, float]
@@ -462,6 +462,18 @@ class SafetyDecision:
     min_predicted_clearance_m: Optional[float]
     time_to_collision_s: Optional[float]
     contract_version: str = CONTRACT_VERSION
+    # Phase 4 (contract v0.2.0, additive - see check_contract_version_compatible's
+    # docstring): the safety-geometry breakdown the Phase 4 safety supervisor
+    # requires distinguishing, split out of the single min_predicted_clearance_m
+    # figure above (which remains the worst-case across all of these, for any
+    # caller that only wants one number). All optional/default-None so every
+    # SafetyDecision constructed before this field set existed remains valid.
+    center_to_center_clearance_m: Optional[float] = None      # nearest neighbor, drone-center to drone-center
+    vehicle_body_clearance_m: Optional[float] = None          # nearest neighbor, edge-to-edge (center-to-center minus both body radii)
+    obstacle_surface_clearance_m: Optional[float] = None      # nearest sensed obstacle edge
+    geofence_distance_m: Optional[float] = None               # signed distance to the nearest geofence boundary (negative = outside)
+    uncertainty_margin_m: Optional[float] = None              # uncertainty inflation actually applied to reach the numbers above
+    braking_distance_m: Optional[float] = None                # this vehicle's own predicted stopping distance at its current speed
 
     def __post_init__(self):
         check_contract_version_compatible(self.contract_version, context="SafetyDecision")
@@ -491,6 +503,19 @@ class SafetyDecision:
             _validate_nonnegative("min_predicted_clearance_m", self.min_predicted_clearance_m)
         if self.time_to_collision_s is not None:
             _validate_nonnegative("time_to_collision_s", self.time_to_collision_s)
+        # center_to_center/uncertainty_margin/braking_distance are plain
+        # distances/magnitudes - never negative. vehicle_body/obstacle_surface
+        # clearance and geofence_distance are signed (a negative value means
+        # "already overlapping"/"already outside the fence" - a real and
+        # important state to represent, not an error).
+        for name in ("center_to_center_clearance_m", "uncertainty_margin_m", "braking_distance_m"):
+            value = getattr(self, name)
+            if value is not None:
+                _validate_nonnegative(name, value)
+        for name in ("vehicle_body_clearance_m", "obstacle_surface_clearance_m", "geofence_distance_m"):
+            value = getattr(self, name)
+            if value is not None:
+                _validate_finite(name, value)
 
 
 # --------------------------------------------------------------------------
