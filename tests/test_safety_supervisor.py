@@ -158,10 +158,29 @@ def test_geofence_well_inside_does_not_trigger():
 # 7/8. altitude floor and ceiling -------------------------------------------
 
 def test_altitude_floor_enforced():
-    d = sup().evaluate(candidate(), own_state(pos=(0.0, 0.0, 0.6)), sensor_obs(), (), ctx(), now_s=1.0)
+    # floor=0.5, altitude_margin_m=0.5 (soft threshold 1.0m), but
+    # altitude_critical_margin_m=0.15 (critical threshold 0.65m) - z=0.8
+    # is inside the soft margin but outside the critical one, isolating
+    # the soft (hysteresis-eligible) tier from the Phase 4.1 critical tier
+    # (see test_altitude_floor_critical_preempts_everything below).
+    d = sup().evaluate(candidate(), own_state(pos=(0.0, 0.0, 0.8)), sensor_obs(), (), ctx(), now_s=1.0)
     assert d.emergency_state == SafetyState.GEOFENCE_RISK
     assert "altitude_floor" in d.active_constraints
     assert d.filtered_command.desired_velocity_mps[2] > 0.0
+
+
+def test_altitude_floor_critical_preempts_everything():
+    """Phase 4.1: within altitude_critical_margin_m of the floor, the
+    critical tier fires instead of the soft one, and preempts even an
+    active separation risk - "altitude floor protection must have
+    priority over horizontal escape when necessary"."""
+    d = sup().evaluate(candidate(vel=(0.0, 0.0, 0.0)), own_state(pos=(0.0, 0.0, 0.6), vel=(0.0, 0.0, 0.0)),
+                        sensor_obs(), (neighbor(pos=(0.1, 0.0, 0.6)),), ctx(), now_s=1.0)
+    assert d.emergency_state == SafetyState.GEOFENCE_RISK
+    assert "altitude_floor_critical" in d.active_constraints
+    out = d.filtered_command.desired_velocity_mps
+    assert out[2] > 0.0
+    assert out[0] == 0.0 and out[1] == 0.0   # pure vertical recovery, no horizontal component
 
 
 def test_altitude_ceiling_enforced():

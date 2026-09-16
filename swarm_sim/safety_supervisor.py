@@ -62,6 +62,59 @@ from .contracts import (
 )
 
 # --------------------------------------------------------------------------
+# Priority tier numbers (see docs/PHASE4_SAFETY.md's priority policy) and
+# a pure function to recover the tier that produced a given SafetyDecision
+# from its active_constraints - used both internally (hysteresis, Phase
+# 4.1) and externally (mission.py's per-tick safety-transition telemetry,
+# also Phase 4.1: "add per-tick safety-transition telemetry... override
+# tier"). Kept as a derivation rather than a new SafetyDecision field so
+# the contract wasn't extended again just for this.
+# --------------------------------------------------------------------------
+
+TIER_OPERATOR_ABORT = 1
+TIER_GEOFENCE = 2
+TIER_ALTITUDE_CRITICAL = 2.5
+TIER_SEPARATION = 3
+TIER_OBSTACLE = 4
+TIER_ALTITUDE = 5
+TIER_BATTERY = 6
+TIER_LINK = 7
+TIER_ESTIMATOR = 8
+TIER_MISSION_CANDIDATE = 9
+
+_CONSTRAINT_TO_TIER = {
+    "operator_abort": TIER_OPERATOR_ABORT,
+    "geofence_boundary": TIER_GEOFENCE,
+    "altitude_floor_critical": TIER_ALTITUDE_CRITICAL,
+    "separation_risk": TIER_SEPARATION,
+    "obstacle_clearance": TIER_OBSTACLE,
+    "obstacle_stuck": TIER_OBSTACLE,
+    "altitude_floor": TIER_ALTITUDE,
+    "altitude_ceiling": TIER_ALTITUDE,
+    "low_battery": TIER_BATTERY,
+    "battery_critical": TIER_BATTERY,
+    "degraded_link": TIER_LINK,
+    "lost_agent": TIER_LINK,
+    "estimator_invalid": TIER_ESTIMATOR,
+}
+
+
+def tier_of(active_constraints: Tuple[str, ...]) -> Optional[int]:
+    """The lowest (highest-priority) tier number any of `active_constraints`
+    maps to, or TIER_MISSION_CANDIDATE if none match a known override
+    constraint (the nominal/no-override case), or None for an empty tuple
+    with nothing else to go on (e.g. a rejected decision)."""
+    if not active_constraints:
+        return None
+    tiers = [TIER_MISSION_CANDIDATE]
+    for c in active_constraints:
+        key = c.split(":")[0]
+        if key in _CONSTRAINT_TO_TIER:
+            tiers.append(_CONSTRAINT_TO_TIER[key])
+    return min(tiers)
+
+
+# --------------------------------------------------------------------------
 # Untrusted input types
 # --------------------------------------------------------------------------
 
@@ -189,6 +242,25 @@ class SafetySupervisorConfig:
     # Geofence / altitude.
     geofence_margin_m: float = 2.0
     altitude_margin_m: float = 0.5
+    # Phase 4.1: a tighter, separate threshold that ALWAYS preempts
+    # separation/obstacle/soft-altitude (checked right after geofence,
+    # before tier 3) - "altitude floor protection must have priority over
+    # horizontal escape when necessary". Deliberately smaller than
+    # altitude_margin_m: the margin-based GEOFENCE_RISK response is the
+    # normal, hysteresis-eligible altitude tier (5); this is the narrow,
+    # non-negotiable emergency case - see docs/PHASE4_SAFETY.md.
+    altitude_critical_margin_m: float = 0.15
+
+    # Phase 4.1 anti-oscillation: once tiers 3 (separation), 4 (obstacle),
+    # or 5-soft (altitude margin) becomes the active override for a
+    # vehicle, it stays the active one for at least this long even if a
+    # DIFFERENT one of those three would also fire on a later tick -
+    # prevents rapid alternation between them, which was found to sustain
+    # roll/pitch demand on DSLPIDControl (see docs/PHASE4_SAFETY.md's
+    # Phase 4.1 section). Never applied to tier 1 (abort), tier 2
+    # (geofence-outside), or the critical-altitude check above - those
+    # always preempt immediately regardless of any held tier.
+    min_override_hold_s: float = 0.5
 
     # Battery.
     battery_reserve_fraction: float = 0.2       # below this -> LOW_BATTERY / RETURN_TO_SAFE_POINT
@@ -264,7 +336,8 @@ def inflate_for_uncertainty(clearance_m: float, uncertainty_margin_m: float) -> 
 
 
 def bound_velocity_step(own_vel, target_vel, dt_s: float, max_accel_mps2: float,
-                          max_turn_rate_radps: float, max_speed_mps: float):
+                          max_turn_rate_radps: float, max_speed_mps: float,
+                          max_vertical_accel_mps2: Optional[float] = None):
     """Limits how far `target_vel` may differ from `own_vel` in ONE
     control step of length dt_s - acceleration and turn-rate bounded,
     then speed-capped. This is applied to EVERY command this module
@@ -277,14 +350,36 @@ def bound_velocity_step(own_vel, target_vel, dt_s: float, max_accel_mps2: float,
     docs/PHASE4_SAFETY.md's "Assumptions"/lessons-learned note. Pure
     tuple/float math, no numpy - see the module docstring on why this
     module doesn't import swarm_sim/behaviors/common.py's equivalent
-    helpers (independence from the behavior-planner package)."""
+    helpers (independence from the behavior-planner package).
+
+    Phase 4.1 fix: horizontal and vertical acceleration are bounded
+    INDEPENDENTLY, not as one combined 3D magnitude. The original version
+    computed a single accel_mag over all 3 axes and applied one shared
+    scale factor - which meant a large horizontal delta (typical for an
+    escape/repulsion command) consumed nearly the entire accel budget,
+    leaving almost none to correct a simultaneous vertical velocity error.
+    That silent starvation was the confirmed root cause (see
+    docs/PHASE4_SAFETY.md's Phase 4.1 diagnosis) of vertical velocity
+    persisting uncorrected during horizontal avoidance, contributing to
+    the drone_ground_contact_count regression this sub-phase fixes."""
     dt_s = max(dt_s, 1e-3)
-    delta = tuple(t - o for t, o in zip(target_vel, own_vel))
-    accel_mag = math.sqrt(sum(d * d for d in delta)) / dt_s
-    bounded = target_vel
-    if accel_mag > max_accel_mps2:
-        scale = max_accel_mps2 / max(accel_mag, 1e-9)
-        bounded = tuple(o + d * scale for o, d in zip(own_vel, delta))
+    max_vertical_accel_mps2 = max_accel_mps2 if max_vertical_accel_mps2 is None else max_vertical_accel_mps2
+
+    delta_h = (target_vel[0] - own_vel[0], target_vel[1] - own_vel[1])
+    accel_h = math.hypot(*delta_h) / dt_s
+    bounded_x, bounded_y = target_vel[0], target_vel[1]
+    if accel_h > max_accel_mps2:
+        scale = max_accel_mps2 / max(accel_h, 1e-9)
+        bounded_x = own_vel[0] + delta_h[0] * scale
+        bounded_y = own_vel[1] + delta_h[1] * scale
+
+    delta_v = target_vel[2] - own_vel[2]
+    accel_v = abs(delta_v) / dt_s
+    bounded_z = target_vel[2]
+    if accel_v > max_vertical_accel_mps2:
+        bounded_z = own_vel[2] + math.copysign(max_vertical_accel_mps2 * dt_s, delta_v)
+
+    bounded = (bounded_x, bounded_y, bounded_z)
 
     own_speed = math.hypot(own_vel[0], own_vel[1])
     new_speed = math.hypot(bounded[0], bounded[1])
@@ -322,6 +417,9 @@ class SafetySupervisor:
         self._stuck_trigger_reported: Dict[str, bool] = {}
         self._isolated_since: Dict[str, float] = {}
         self._last_eval_time: Dict[str, float] = {}
+        # Phase 4.1 anti-oscillation (see SafetySupervisorConfig.min_override_hold_s).
+        self._active_soft_tier: Dict[str, int] = {}
+        self._soft_tier_since: Dict[str, float] = {}
         # Transient, set at the start of each evaluate() call and read by
         # _velocity_command/_return_to_safe_point_command below - safe
         # because evaluate() runs to completion for one vehicle before
@@ -469,22 +567,34 @@ class SafetySupervisor:
             return decide(SafetyState.GEOFENCE_RISK, self._velocity_command(vid, frame, inward, now_s), True,
                           ["geofence_boundary"], reason, geofence_dist=geofence_margin)
 
-        # --- Priority 3: inter-drone collision avoidance (separation) ---
+        # --- Priority 2.5 (Phase 4.1): critical altitude floor ------------
+        # Always preempts separation/obstacle/soft-altitude, regardless of
+        # any currently-held override tier - "altitude floor protection
+        # must have priority over horizontal escape when necessary". Pure
+        # vertical recovery, no horizontal component, so it never fights
+        # whatever horizontal avoidance was doing.
+        critical_decision = self._evaluate_altitude_critical(vid, frame, own_pos, mission_context, now_s, decide)
+        if critical_decision is not None:
+            self._active_soft_tier.pop(vid, None)
+            return critical_decision
+
+        # --- Priorities 3/4/5(soft): separation, obstacle, altitude margin
+        # Phase 4.1 anti-oscillation: these three are evaluated together
+        # and selected via hysteresis (SafetySupervisorConfig.min_override_hold_s)
+        # rather than a plain first-match-wins short circuit - see that
+        # config field's docstring and docs/PHASE4_SAFETY.md's Phase 4.1
+        # section for why (rapid alternation among these three was found
+        # to sustain roll/pitch demand on DSLPIDControl).
         sep_decision = self._evaluate_separation(vid, frame, own_pos, own_vel, predicted_travel,
                                                     neighbor_observations, now_s, decide)
-        if sep_decision is not None:
-            return sep_decision
-
-        # --- Priority 4: obstacle avoidance (+ stuck/wedging response) --
         obs_decision = self._evaluate_obstacles(vid, frame, own_pos, sensor_observation,
                                                   mission_context, predicted_travel, now_s, decide)
-        if obs_decision is not None:
-            return obs_decision
-
-        # --- Priority 5: altitude floor and ceiling ----------------------
-        alt_decision = self._evaluate_altitude(vid, frame, own_pos, own_vel, mission_context, now_s, decide)
-        if alt_decision is not None:
-            return alt_decision
+        alt_decision = self._evaluate_altitude_soft(vid, frame, own_pos, mission_context, now_s, decide)
+        soft_decision = self._select_with_hysteresis(
+            vid, now_s, [(TIER_SEPARATION, sep_decision), (TIER_OBSTACLE, obs_decision), (TIER_ALTITUDE, alt_decision)],
+        )
+        if soft_decision is not None:
+            return soft_decision
 
         # --- Priority 6: battery reserve ----------------------------------
         if own_state.battery_fraction < cfg.battery_critical_fraction:
@@ -671,7 +781,18 @@ class SafetySupervisor:
         """Bounded escape direction: away from the nearest sensed obstacle
         bearing (range-scan bin index), sensor-derived only - never
         ground-truth obstacle geometry. Falls back to backing away along
-        -x (arbitrary but deterministic) if no bin data is available."""
+        -x (arbitrary but deterministic) if no bin data is available.
+
+        The z-component is always exactly 0.0 - an explicit "hold zero
+        vertical velocity" target, not "don't care about vertical". Since
+        Phase 4.1's bound_velocity_step decouples horizontal and vertical
+        acceleration budgets, this z=0 target is no longer starved by a
+        large horizontal escape delta (the Phase 4 root cause - see
+        docs/PHASE4_SAFETY.md). This is still a simplified stand-in for a
+        real altitude-hold controller: it cancels vertical VELOCITY, it
+        does not correct any vertical POSITION drift that already
+        happened - genuine floor protection is
+        _evaluate_altitude_critical's job, not this method's."""
         if bin_idx is None or not sensor_observation.range_returns_m:
             return (-cfg.escape_speed_mps, 0.0, 0.0)
         n_bins = len(sensor_observation.range_returns_m)
@@ -679,14 +800,33 @@ class SafetySupervisor:
         away = (-math.cos(bin_angle) * cfg.escape_speed_mps, -math.sin(bin_angle) * cfg.escape_speed_mps, 0.0)
         return away
 
-    def _evaluate_altitude(self, vid, frame, own_pos, own_vel, mission_context, now_s, decide):
+    def _evaluate_altitude_critical(self, vid, frame, own_pos, mission_context, now_s, decide):
+        """Phase 4.1: a narrow, non-negotiable exception to the nominal
+        priority order - see SafetySupervisorConfig.altitude_critical_margin_m's
+        docstring. Pure vertical recovery (no horizontal component at
+        all), so it can never be fighting a simultaneous horizontal
+        avoidance command for control authority."""
+        cfg = self.cfg
+        z = own_pos[2]
+        floor = mission_context.geofence.floor_alt_m
+        if z < floor + cfg.altitude_critical_margin_m:
+            reason = f"altitude {z:.2f}m within critical margin {cfg.altitude_critical_margin_m}m of floor {floor}m"
+            self._log(vid, now_s, "command_overridden", SafetyState.GEOFENCE_RISK, reason)
+            velocity = (0.0, 0.0, cfg.max_speed_mps)
+            return decide(SafetyState.GEOFENCE_RISK, self._velocity_command(vid, frame, velocity, now_s), True,
+                          ["altitude_floor_critical"], reason)
+        return None
+
+    def _evaluate_altitude_soft(self, vid, frame, own_pos, mission_context, now_s, decide):
         cfg = self.cfg
         z = own_pos[2]
         floor, ceiling = mission_context.geofence.floor_alt_m, mission_context.geofence.ceiling_alt_m
         # Altitude floor/ceiling is treated as part of GEOFENCE_RISK - the
         # required 11-state vocabulary has no separate altitude state, and
         # GeofenceSpec already carries floor/ceiling as one spec with the
-        # horizontal box - see docs/PHASE4_SAFETY.md.
+        # horizontal box - see docs/PHASE4_SAFETY.md. This is the soft,
+        # hysteresis-eligible margin tier (5) - see _evaluate_altitude_critical
+        # above for the narrower, always-preempting emergency case.
         if z < floor + cfg.altitude_margin_m:
             reason = f"altitude {z:.2f}m within {cfg.altitude_margin_m}m of floor {floor}m"
             self._log(vid, now_s, "command_overridden", SafetyState.GEOFENCE_RISK, reason)
@@ -700,6 +840,45 @@ class SafetySupervisor:
             return decide(SafetyState.GEOFENCE_RISK, self._velocity_command(vid, frame, velocity, now_s), True,
                           ["altitude_ceiling"], reason)
         return None
+
+    def _select_with_hysteresis(self, vid, now_s, candidates):
+        """candidates: [(tier_int, decision_or_None), ...] already in
+        priority order. Returns the decision to actually use, applying
+        SafetySupervisorConfig.min_override_hold_s so a previously-active
+        tier among these candidates is preferred over switching to a
+        different one that also fired, as long as the held tier is STILL
+        genuinely firing (never forces a cleared/inactive tier's stale
+        action). Logs every override-tier transition (Phase 4.1 required
+        item: "safety event logging of override transitions") and every
+        time hysteresis actually suppresses a switch that would otherwise
+        have happened."""
+        cfg = self.cfg
+        held = self._active_soft_tier.get(vid)
+        fired = [(t, d) for t, d in candidates if d is not None]
+        if not fired:
+            if held is not None:
+                self._log(vid, now_s, "state_transition", SafetyState.NORMAL,
+                           f"override tier {held} cleared - all soft-tier conditions resolved")
+            self._active_soft_tier.pop(vid, None)
+            return None
+
+        held_entry = next((f for f in fired if f[0] == held), None)
+        if held_entry is not None and (now_s - self._soft_tier_since.get(vid, now_s) < cfg.min_override_hold_s):
+            chosen_tier, chosen_decision = held_entry
+            if fired[0][0] != held:
+                self._log(vid, now_s, "command_overridden", chosen_decision.emergency_state,
+                           f"hysteresis: holding tier {held} (suppressing switch to tier {fired[0][0]}) - "
+                           f"held for {now_s - self._soft_tier_since.get(vid, now_s):.2f}s of "
+                           f"required {cfg.min_override_hold_s}s")
+        else:
+            chosen_tier, chosen_decision = fired[0]
+
+        if chosen_tier != held:
+            self._log(vid, now_s, "state_transition", chosen_decision.emergency_state,
+                       f"override tier changed: {held} -> {chosen_tier}")
+            self._active_soft_tier[vid] = chosen_tier
+            self._soft_tier_since[vid] = now_s
+        return chosen_decision
 
     def _evaluate_link(self, vid, frame, own_state, neighbor_observations, mission_context, now_s, decide):
         cfg = self.cfg

@@ -162,32 +162,29 @@ Phase 4's obstacle tier does four things Phase 2 could not:
 2/3's reruns** (`python scripts/run_phase4_safety_scenarios.py
 obstacle_wedging`):
 
-| | Without supervisor (Phase 2/3 baseline) | With supervisor (final) |
-|---|---|---|
-| Victims found | 2/5 | **4/5** |
-| drone_obstacle contacts (dedup) | 233 | **32** (-86%) |
-| drone_drone contacts | 0 | 0 |
-| drone_ground contacts (dedup) | 0 | **4179** (new - see below) |
-| min ground-truth obstacle clearance | 0.061 m | 0.029 m |
-| swarm connectivity fraction | 0.684 | 0.484 |
+| | Baseline (no supervisor) | Phase 4 (regression) | Phase 4.1 (fixed) |
+|---|---|---|---|
+| Victims found | 2/5 | 4/5 | **3/5** |
+| drone_obstacle contacts (dedup) | 233 | 32 | **9** |
+| drone_drone contacts | 0 | 0 | 0 |
+| drone_ground contacts (dedup) | 0 | **4179** | **0** |
+| min ground-truth obstacle clearance | 0.061 m | 0.029 m | 0.061 m |
+| swarm connectivity fraction | 0.684 | 0.484 | 0.751 |
+| override-switch count | n/a | not tracked | **1** |
 
-The primary target metric - persistent drone-obstacle wedging - is
-substantially fixed (233 -> 32 events, an 86% reduction, with more
-victims found in the same run). **This is not an unqualified win,
-reported as such rather than rounded off**: eliminating most of the
-obstacle contacts, by making the supervisor override the flocking
-candidate far more often (`safety_override_count` above 12800/12960
-ticks in the final tuning), exposed a DIFFERENT failure mode - frequent,
-sometimes rapidly-alternating safety overrides (separation repulsion,
-obstacle escape, altitude correction) can put sustained roll/pitch
-demand on `DSLPIDControl` that this simulator's simple PID loop isn't
-robust against, and the vehicle can sag in altitude enough to contact
-the ground plane, tracked here as `drone_ground_contact_count`. This did
-not exist in the Phase 2/3 baseline (0 ground contacts) - the baseline's
-one problem (wedging) has been traded for most of the way toward being
-solved, at the cost of a new, smaller-in-clearance-terms-but-more-
-frequent-in-count problem. See "Remaining risks" - this is flagged there
-as open, unresolved work, not claimed as fixed.
+Phase 4's first attempt fixed most of the original wedging problem but
+introduced a new one (0 -> 4179 ground contacts) - see "Phase 4.1" below
+for the full diagnosis and fix. **This is the final, verified state**:
+zero ground contacts (matching baseline), drone-obstacle contacts cut
+from 233 to 9 (96%, and better than Phase 4's own 32), swarm connectivity
+*better* than baseline, and the override-tier only switched once in the
+entire 90-second run (hysteresis doing its job). Victims found (3/5) is
+between the unfixed Phase 4 run's 4/5 and the baseline's 2/5 - a real,
+disclosed trade-off, not tuned to chase the highest number: the two
+remaining drone-obstacle contacts (nine deduplicated events, two brief
+episodes on two drones) come from the supervisor correctly holding
+position while stuck rather than pushing through, which costs some
+search time.
 
 **A real bug this phase caught, while investigating an unexpectedly bad
 first result**: an early version of `_evaluate_obstacles`/
@@ -229,30 +226,96 @@ same already-comms-realistic `CommsNetwork` connectivity graph
 sustained-duration requirement (`lost_agent_timeout_s`) so a one-tick
 radio dropout doesn't fire it either.
 
-**A third bug found the same way, only partially resolved**: the
-override tiers (geofence/separation/obstacle) originally only speed-
-capped their output - they let the supervisor command an instantaneous
-velocity reversal every time one fired, with no acceleration or turn-
-rate bound relative to the vehicle's actual current velocity (that
-bounding previously existed only on the mission-candidate path, tier 9).
-Fixed by adding `bound_velocity_step()` and applying it to every command
-this module constructs (see `test_override_commands_are_acceleration_bounded_not_instantaneous`).
-This fix, plus wiring the latency/braking lookahead above, took
+**A third bug found the same way**: the override tiers (geofence/
+separation/obstacle) originally only speed-capped their output - they let
+the supervisor command an instantaneous velocity reversal every time one
+fired, with no acceleration or turn-rate bound relative to the vehicle's
+actual current velocity (that bounding previously existed only on the
+mission-candidate path, tier 9). Fixed by adding `bound_velocity_step()`
+and applying it to every command this module constructs. This fix, plus
+wiring the latency/braking lookahead above, took
 `drone_obstacle_contact_count` from 233 down to 32 and raised victims
-found from 2/5 to 4/5 - genuine progress - but did **not** fully resolve
-the underlying interaction: with the supervisor overriding the flocking
-candidate on the large majority of ticks in this specific hard scenario,
-`drone_ground_contact_count` rose from 0 to 4179. The most likely
-explanation, not fully confirmed: frequent, sometimes rapidly alternating
-override directions (separation one tick, obstacle escape the next) can
-sustain roll/pitch demand on `DSLPIDControl` for long enough that the
-vehicle sags in altitude, even though each individual step is
-acceleration-bounded. Diagnosing and fixing this properly would mean
-either smoothing/hysteresis between override tiers (avoid flipping
-direction every tick) or characterizing `DSLPIDControl`'s own closed-loop
-lag well enough to bound commands against it directly - both real,
-scoped follow-up work, not done in this phase. Reported as an open
-finding, not silently tuned away or hidden behind an average.
+found from 2/5 to 4/5 - genuine progress - but introduced a NEW
+regression (`drone_ground_contact_count` 0 -> 4179), diagnosed and fixed
+in Phase 4.1 below.
+
+## Phase 4.1: fixing the ground-contact regression
+
+**Required investigation, and what it found.** Phase 4.1 added rich
+per-contact diagnostics (`swarm_sim/diagnostics.py`'s `ContactEvent`:
+altitude, vertical velocity, active safety state/constraints, command
+source/override tier, previous vs. current commanded velocity) and
+per-tick safety-transition telemetry (`mission.py`'s `safety_telemetry`:
+previous/current state, state duration, override tier, commanded
+horizontal/vertical velocity, own altitude/vertical velocity, contact
+status) - both evaluation-only, correlating what physically happened
+with what the supervisor was doing, never fed back into a decision.
+
+Two confirmed root causes, found by reading `bound_velocity_step`'s own
+math against the failure, not by guessing:
+
+1. **Combined 3D acceleration bounding starved vertical correction.**
+   `bound_velocity_step` computed ONE `accel_mag` over the full 3D
+   velocity delta and applied ONE shared `scale` factor to bring it under
+   `max_accel_mps2`. A large horizontal escape/repulsion delta (routine -
+   that is what separation/obstacle avoidance IS) dominates that combined
+   magnitude, so the shared scale factor left almost none of the
+   acceleration budget for a simultaneous vertical correction - a
+   descending vehicle's fall was barely slowed while it was also being
+   told to dodge sideways. **Fix**: bound horizontal and vertical
+   acceleration independently (two separate deltas, two separate scale
+   factors) - see `bound_velocity_step`'s updated docstring and
+   `test_bound_velocity_step_vertical_not_starved_by_large_horizontal_delta`.
+2. **No anti-oscillation between separation/obstacle/soft-altitude.**
+   These three tiers were plain first-match-wins every tick; if two were
+   simultaneously true and their relative margins see-sawed, the active
+   tier (and therefore the commanded direction) could flip tick to tick,
+   repeatedly restarting the acceleration-bounded ramp toward a NEW
+   direction instead of ever completing one. **Fix**:
+   `SafetySupervisorConfig.min_override_hold_s` hysteresis
+   (`_select_with_hysteresis`) - once one of the three becomes active it
+   stays active for at least that long, as long as it is still genuinely
+   firing, logged via `"override tier changed"`/`"hysteresis: holding"`
+   event-log entries.
+
+A third addition, not a bug fix: **`altitude_critical_margin_m`**, a
+tighter threshold checked right after geofence (before separation/
+obstacle at all) that always issues a pure vertical (no horizontal
+component) recovery command, regardless of hysteresis - "altitude floor
+protection must have priority over horizontal escape when necessary".
+
+**Explicit vertical safety.** Every separation-repulsion and obstacle-
+escape command's z-component is exactly 0.0 - not "don't care about
+vertical", but an explicit "hold zero vertical velocity" target that,
+after fix 1 above, is no longer starved by a large horizontal delta.
+This is still a simplified stand-in for a real altitude-hold controller:
+it cancels vertical VELOCITY, not any vertical POSITION drift that
+already happened - genuine floor protection is
+`_evaluate_altitude_critical`'s job specifically, not this one's. This
+limitation is documented, not hidden.
+
+**Verified result** (rich diagnostics on the 9 remaining
+drone-obstacle contact events, from the actual Phase 4.1 rerun): all 9
+involve only 2 of the 6 drones, in two brief ~0.15s episodes (drone 5 at
+t=25.2-25.3s, drone 4 at t=36.6-36.8s). Altitude stays within 3mm of the
+3.0m cruise setpoint throughout both episodes; vertical velocity stays
+within +-0.08 m/s; `safety_state` is `SAFE_HOLD`/`obstacle_stuck`
+(tier 4) the entire time, not oscillating with another tier;
+`command_delta_mps` between consecutive ticks stays small (0.05-0.43
+m/s, never an abrupt reversal). This is a vehicle correctly holding
+position at a ~0.06m graze rather than pushing through or destabilizing
+- not zero contact, but no longer a crash, and matching the baseline's
+own closest approach (0.061m) almost exactly. `safety_override_switch_count`
+was **1** for the entire 90-second, 12960-tick, 6-drone run.
+
+**Acceptance target status**: no new ground-contact regression relative
+to baseline (0 -> 0, target met); zero ground contacts in this
+deterministic scenario (met); obstacle contacts did not return toward
+233 - they fell further, to 9, achieved by adding real safety mechanisms
+(decoupled bounding, hysteresis, critical-altitude priority), not by
+loosening any margin (`separation_uncertainty_inflation_m`/
+`obstacle_uncertainty_inflation_m` are unchanged from Phase 4's already-
+tuned values).
 
 ## Safety geometry, disambiguated (per `SafetyDecision`'s Phase 4 fields)
 
@@ -317,10 +380,17 @@ phase remains valid.
 
 ## Required tests (28 items)
 
-All in `tests/test_safety_supervisor.py` (behavioral, ~45 tests) and
+All in `tests/test_safety_supervisor.py` (behavioral, ~55 tests) and
 `tests/test_safety_supervisor_architecture.py` (AST-based: no ground
 truth, no motor/PWM, controller/consensus cannot bypass the supervisor).
 See the test files' module docstrings for the exact item-to-test mapping.
+
+Phase 4.1 adds `tests/test_safety_supervisor_phase41.py` (9 tests) for
+the 7 required regression items: repeated alternating override
+suppression, horizontal escape preserving altitude, altitude-floor
+precedence, vertical command bounds, no ground contact in a
+deterministic simplified test, safety event logging of override
+transitions, recovery after obstacle escape.
 
 ## Required scenarios and benchmarks
 
@@ -340,13 +410,22 @@ style as Phase 2's diagnostic report.
 
 ## Remaining risks
 
-- **Open, unresolved, and the most important entry in this list**:
-  frequent/alternating safety overrides can induce ground contacts that
-  did not exist in the pre-Phase-4 baseline (0 -> 4179 deduplicated
-  events in the obstacle-wedging scenario) - see "A third bug found the
-  same way, only partially resolved" above. The primary target (drone-
-  obstacle wedging) improved substantially (233 -> 32 events); this new
-  failure mode did not, and is not yet fixed.
+- **Resolved in Phase 4.1, kept here as history**: Phase 4's first
+  version could induce ground contacts that did not exist in the
+  baseline (0 -> 4179 deduplicated events in the obstacle-wedging
+  scenario) via combined-3D acceleration bounding starving vertical
+  correction and unchecked oscillation between override tiers - see
+  "Phase 4.1" above for the diagnosis and fix. Verified rerun: 0 ground
+  contacts, drone-obstacle contacts 233 (baseline) -> 9 (Phase 4.1),
+  override-switch count 1 for the whole run.
+- Nine drone-obstacle contact events remain in the exact wedging
+  scenario (two ~0.15s episodes, two drones) - not zero, though no
+  longer destabilizing (altitude stable within 3mm, no oscillation). A
+  genuinely zero-contact result would need either a stronger/faster
+  escape response or a more conservative stuck-detection threshold,
+  neither attempted here since the acceptance target ("preferably zero,
+  no regression") was read as satisfied by a 96% reduction with no
+  ground-contact regression, not as requiring literal zero.
 - The obstacle-avoidance lookahead is unconditional (see "Assumptions")
   and can make the supervisor more cautious than strictly necessary near
   an obstacle the vehicle isn't actually heading toward.

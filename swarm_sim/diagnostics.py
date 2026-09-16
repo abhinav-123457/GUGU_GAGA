@@ -58,6 +58,19 @@ class ContactEvent:
     command_age_s: Optional[float]
     observation_dropout_or_stale: bool
     clearance_trend: str  # "closing" | "opening" | "unknown" - before vs after this tick
+    # Phase 4.1 diagnostic extension (additive, all defaulted - required
+    # investigation item 1: "classify all ground contacts" with the
+    # supervisor's own state at that tick, not just the physics). See
+    # docs/PHASE4_SAFETY.md's Phase 4.1 section.
+    altitude_m: Optional[float] = None
+    vertical_velocity_mps: Optional[float] = None
+    safety_state: Optional[str] = None
+    active_constraints: Tuple[str, ...] = ()
+    command_source: Optional[str] = None
+    override_tier: Optional[float] = None
+    previous_command_velocity_mps: Optional[Tuple[float, float, float]] = None
+    current_command_velocity_mps: Optional[Tuple[float, float, float]] = None
+    command_delta_mps: Optional[float] = None
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -192,7 +205,10 @@ class MissionDiagnostics:
 
     def classify_contact(self, t, body_a, body_b, drone_id_set, obstacle_body_ids,
                           estimated_clearance_m, actual_clearance_m, sensor_age_s, command_age_s,
-                          observation_dropout_or_stale, drone_ids_involved, pair_key) -> ContactEvent:
+                          observation_dropout_or_stale, drone_ids_involved, pair_key,
+                          altitude_m=None, vertical_velocity_mps=None, safety_state=None,
+                          active_constraints=(), command_source=None, override_tier=None,
+                          previous_command_velocity_mps=None, current_command_velocity_mps=None) -> ContactEvent:
         if body_a in drone_id_set and body_b in drone_id_set:
             category = "drone_drone"
         elif (body_a in drone_id_set and body_b in obstacle_body_ids) or \
@@ -220,12 +236,22 @@ class MissionDiagnostics:
         if actual_clearance_m is not None:
             self._prev_actual_clearance[pair_key] = actual_clearance_m
 
+        command_delta_mps = None
+        if previous_command_velocity_mps is not None and current_command_velocity_mps is not None:
+            command_delta_mps = math.hypot(
+                *(c - p for c, p in zip(current_command_velocity_mps, previous_command_velocity_mps))
+            )
+
         event = ContactEvent(
             t=t, category=category, body_a=body_a, body_b=body_b,
             drone_ids_involved=tuple(drone_ids_involved),
             estimated_clearance_m=estimated_clearance_m, actual_clearance_m=actual_clearance_m,
             sensor_age_s=sensor_age_s, command_age_s=command_age_s,
             observation_dropout_or_stale=observation_dropout_or_stale, clearance_trend=trend,
+            altitude_m=altitude_m, vertical_velocity_mps=vertical_velocity_mps, safety_state=safety_state,
+            active_constraints=tuple(active_constraints), command_source=command_source,
+            override_tier=override_tier, previous_command_velocity_mps=previous_command_velocity_mps,
+            current_command_velocity_mps=current_command_velocity_mps, command_delta_mps=command_delta_mps,
         )
         self.contact_log.append(event)
         return event

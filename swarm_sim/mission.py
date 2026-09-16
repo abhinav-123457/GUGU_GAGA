@@ -40,7 +40,7 @@ from .diagnostics import MissionDiagnostics
 from .network import CommsNetwork
 from .recruitment import RecruitmentBoard
 from .safety_supervisor import (
-    CandidateCommand, MissionContext, SafetySupervisor, SafetySupervisorConfig,
+    TIER_MISSION_CANDIDATE, CandidateCommand, MissionContext, SafetySupervisor, SafetySupervisorConfig, tier_of,
 )
 from .seeding import SeedManager
 from .sensors import NeighborSensorModel, ObstacleRangeSensor, VictimSensorModel
@@ -161,6 +161,17 @@ class FloodSearchMission:
         self._safety_override_count = 0
         self._safety_state_counts = {}
         self._safety_cpu_time_s = 0.0
+        # Phase 4.1 diagnostics: per-tick safety-transition telemetry
+        # (required investigation item 2) plus the extra bookkeeping
+        # needed to compute override-switch-count/longest-override-duration
+        # for the Phase 4.1 rerun report - see docs/PHASE4_SAFETY.md.
+        self.safety_telemetry = []
+        self._prev_safety_state = {}
+        self._state_since = {}
+        self._prev_safety_tier = {}
+        self._prev_command_velocity = {}
+        self._safety_override_switch_count = 0
+        self._safety_longest_override_duration_s = 0.0
 
         # Phase 2 sensing: three independent RNG streams (never one shared
         # stream - see docs/PHASE2_SENSING.md), scoped just to sensing so
@@ -428,17 +439,25 @@ class FloodSearchMission:
             return True
         return bool(p.getContactPoints(bodyB=body_id, physicsClientId=client))
 
-    def _classify_and_log_contacts(self, t, positions, tick_neighbor_obs, tick_range_returns):
+    def _classify_and_log_contacts(self, t, positions, velocities, tick_neighbor_obs, tick_range_returns,
+                                     tick_safety_context):
         """SCORING/EVALUATION ONLY. Classifies every PyBullet-verified
         physical contact this tick involving a drone, correlating it with
         each involved drone's own sensing state at that same tick.
 
+        Phase 4.1 extends this with each involved drone's SAFETY state at
+        that tick (tick_safety_context - altitude, vertical velocity,
+        active safety state/constraints, command source/tier, previous
+        vs. current commanded velocity) - required investigation item 1
+        ("classify all ground contacts"). Still evaluation-only: reading
+        this richer context for the report does not feed anything back
+        into a decision.
+
         CRITICAL LIMITATION (see docs/PHASE2_DIAGNOSTICS.md): this is
-        evaluation instrumentation, not a safety mechanism. Nothing here
-        prevented, predicted, or reacted to any of these contacts - they
-        are logged strictly after the fact, for the report. Phase 4's
-        safety supervisor is the phase where a clearance estimate is
-        actually allowed to change a command."""
+        evaluation instrumentation, not a safety mechanism (Phase 4's
+        SafetySupervisor is the actual safety mechanism; this method
+        still only records, after the fact, what happened and what state
+        the supervisor was in)."""
         client = self.env.getPyBulletClient()
         contacts = p.getContactPoints(physicsClientId=client)
         relevant = [c for c in contacts if c[1] in self._drone_id_set or c[2] in self._drone_id_set]
@@ -487,6 +506,12 @@ class FloodSearchMission:
                     actual_clearance_m = float(positions[drone_idx, 2])  # height above the ground plane
                     estimated_clearance_m = None  # no downward/ground sensor modeled - see limitation
 
+            # Phase 4.1: correlate with the FIRST involved drone's own
+            # safety-supervisor context this tick (drone_ground/drone_obstacle
+            # contacts involve exactly one drone; drone_drone picks the
+            # lower-indexed one - a documented, simple choice, not both).
+            safety_ctx = tick_safety_context.get(drone_ids_involved[0], {}) if drone_ids_involved else {}
+
             self.diagnostics.classify_contact(
                 t=t, body_a=body_a, body_b=body_b, drone_id_set=self._drone_id_set,
                 obstacle_body_ids=self._obstacle_body_ids,
@@ -494,6 +519,11 @@ class FloodSearchMission:
                 sensor_age_s=sensor_age_s, command_age_s=sensor_age_s,  # proxy - see docs/PHASE2_DIAGNOSTICS.md
                 observation_dropout_or_stale=stale_or_dropout,
                 drone_ids_involved=drone_ids_involved, pair_key=pair_key,
+                altitude_m=safety_ctx.get("altitude_m"), vertical_velocity_mps=safety_ctx.get("vertical_velocity_mps"),
+                safety_state=safety_ctx.get("safety_state"), active_constraints=safety_ctx.get("active_constraints", ()),
+                command_source=safety_ctx.get("command_source"), override_tier=safety_ctx.get("override_tier"),
+                previous_command_velocity_mps=safety_ctx.get("previous_command_velocity_mps"),
+                current_command_velocity_mps=safety_ctx.get("current_command_velocity_mps"),
             )
 
     def _update_drone_labels(self, positions):
@@ -549,6 +579,7 @@ class FloodSearchMission:
             already_found_mask = [vid in self.victims_found for vid in range(cfg.num_victims)]
             tick_neighbor_obs = {}
             tick_range_returns = {}
+            tick_safety_context = {}
 
             for i in range(cfg.num_drones):
                 heading_xy = self.controller.headings[i][:2].copy()
@@ -640,6 +671,47 @@ class FloodSearchMission:
                         self._safety_rejected_count += 1
                         safe_vel = np.zeros(3)
 
+                    # Phase 4.1 required investigation item 2: per-tick
+                    # safety-transition telemetry, plus the bookkeeping
+                    # needed for the rerun report's override-switch-count/
+                    # longest-override-duration metrics.
+                    prev_state = self._prev_safety_state.get(i)
+                    if prev_state != state_name:
+                        if prev_state is not None and prev_state != "NORMAL":
+                            duration = t - self._state_since.get(i, t)
+                            self._safety_longest_override_duration_s = max(
+                                self._safety_longest_override_duration_s, duration,
+                            )
+                        self._state_since[i] = t
+                    self._prev_safety_state[i] = state_name
+
+                    tier = tier_of(decision.active_constraints)
+                    prev_tier = self._prev_safety_tier.get(i)
+                    if (prev_tier is not None and tier is not None and prev_tier != tier
+                            and prev_tier != TIER_MISSION_CANDIDATE and tier != TIER_MISSION_CANDIDATE):
+                        self._safety_override_switch_count += 1
+                    self._prev_safety_tier[i] = tier
+
+                    current_cmd_vel = tuple(float(v) for v in safe_vel)
+                    prev_cmd_vel = self._prev_command_velocity.get(i, (0.0, 0.0, 0.0))
+                    tick_safety_context[i] = {
+                        "altitude_m": float(positions[i, 2]), "vertical_velocity_mps": float(velocities[i, 2]),
+                        "safety_state": state_name, "active_constraints": decision.active_constraints,
+                        "command_source": (decision.filtered_command.source
+                                            if decision.filtered_command else "SwarmController_bypass"),
+                        "override_tier": tier, "previous_command_velocity_mps": prev_cmd_vel,
+                        "current_command_velocity_mps": current_cmd_vel,
+                    }
+                    self._prev_command_velocity[i] = current_cmd_vel
+                    self.safety_telemetry.append({
+                        "t": t, "drone_id": i, "previous_state": prev_state, "current_state": state_name,
+                        "state_duration_s": t - self._state_since.get(i, t), "override_tier": tier,
+                        "commanded_horizontal_velocity_mps": math.hypot(current_cmd_vel[0], current_cmd_vel[1]),
+                        "commanded_vertical_velocity_mps": current_cmd_vel[2],
+                        "own_altitude_m": float(positions[i, 2]), "own_vertical_velocity_mps": float(velocities[i, 2]),
+                        "contact_status": bool(mission_context.contact_detected),
+                    })
+
                 target_vel, applied_speed = self.speed_ctrl.to_velocity_command(i, safe_vel)
                 # Anchor altitude via real position feedback (z held at flight_altitude);
                 # x/y are left to pure velocity tracking so the swarm behavior drives motion.
@@ -674,7 +746,8 @@ class FloodSearchMission:
             self._resolve_confirmed_detections(t)
             self.diagnostics.consensus_cpu_time_s += timemod.perf_counter() - consensus_t0
 
-            self._classify_and_log_contacts(t, positions, tick_neighbor_obs, tick_range_returns)
+            self._classify_and_log_contacts(t, positions, velocities, tick_neighbor_obs, tick_range_returns,
+                                              tick_safety_context)
 
             if cfg.gui:
                 if step % 4 == 0:  # a few times a second is plenty legible, and far gentler on the debug renderer
@@ -745,4 +818,8 @@ class FloodSearchMission:
             "safety_state_counts": dict(self._safety_state_counts),
             "safety_cpu_time_s": self._safety_cpu_time_s,
             "safety_event_log": [e.to_dict() for e in self.safety.event_log],
+            # Phase 4.1 - see docs/PHASE4_SAFETY.md's Phase 4.1 section.
+            "safety_override_switch_count": self._safety_override_switch_count,
+            "safety_longest_override_duration_s": self._safety_longest_override_duration_s,
+            "safety_telemetry": self.safety_telemetry,
         }
