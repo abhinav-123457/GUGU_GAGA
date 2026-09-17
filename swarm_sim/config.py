@@ -166,13 +166,25 @@ class MissionConfig:
     # see docs/PHASE6_AUTOPILOT_ADAPTERS.md. "mock_adapter" is the
     # architectural reference path: every command additionally passes
     # through AutopilotAdapter.send_command() (frame/sequence/freshness/
-    # connection-state validated) before reaching PyBullet.
-    autopilot_path: str = "mock_adapter"     # "mock_adapter" | "direct"
+    # connection-state validated) before reaching PyBullet. Phase 7 adds
+    # "fake_sitl" (swarm_sim/sitl/): the same validated command additionally
+    # passes through a SITLTransport (FakeSITLTransport) one layer below the
+    # adapter - see docs/PHASE7_SITL_INTEGRATION.md.
+    autopilot_path: str = "mock_adapter"     # "mock_adapter" | "fake_sitl" | "direct"
     autopilot_command_latency_s: float = 0.0
     autopilot_telemetry_latency_s: float = 0.0
     autopilot_command_packet_loss_prob: float = 0.0
     autopilot_telemetry_packet_loss_prob: float = 0.0
     autopilot_telemetry_stale_timeout_s: float = 1.0
+
+    # Phase 7: local, offline SITL integration boundary (swarm_sim/sitl/) -
+    # only used when autopilot_path == "fake_sitl". Deliberately separate
+    # from the Phase 6 fields above even though several are conceptually
+    # similar (SITLAdapter/FakeSITLTransport are a distinct implementation,
+    # not a drop-in replacement for MockAdapter) - see
+    # docs/PHASE7_SITL_INTEGRATION.md.
+    sitl_ack_timeout_s: float = 5.0
+    sitl_future_tolerance_s: float = 0.05
 
     # Simulation
     duration_sec: float = 90.0

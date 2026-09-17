@@ -38,6 +38,7 @@ from .autopilot import AdapterCommand as AutopilotAdapterCommand
 from .autopilot import ConnectionState as AutopilotConnectionState
 from .autopilot import MockAdapter
 from .autopilot import VehicleTelemetry as AutopilotVehicleTelemetry
+from .autopilot.sitl import SITLAdapter
 from .consensus import ConsensusBoard
 from .contracts import CommandType, Frame, GeofenceSpec, HealthState, SensorObservation, VehicleState
 from .controller import SwarmController
@@ -49,6 +50,7 @@ from .safety_supervisor import (
 )
 from .seeding import SeedManager
 from .sensors import NeighborSensorModel, ObstacleRangeSensor, VictimSensorModel
+from .sitl import FakeSITLTransport
 from .speed_control import SpeedController
 from .telemetry import TelemetryHub
 
@@ -216,7 +218,16 @@ class FloodSearchMission:
         # additionally passes through MockAdapter.send_command() before
         # reaching PyBullet. "direct" is the pre-Phase-6 path, kept only
         # as a temporary comparison baseline - see run()'s per-drone loop.
+        # Phase 7: "fake_sitl" (swarm_sim/sitl/) routes the same
+        # safety-evaluated Command one layer further, through a SITLAdapter
+        # backed by a single shared, multi-vehicle FakeSITLTransport - see
+        # docs/PHASE7_SITL_INTEGRATION.md. mission.py's own call site
+        # (`_send_to_autopilot_adapter` below) is unchanged either way: it
+        # only ever calls the AutopilotAdapter Protocol's own
+        # `send_command`, so it cannot tell (and does not need to know)
+        # which adapter type is behind `self.autopilot_adapters[i]`.
         self.autopilot_adapters = {}
+        self.sitl_transport = None
         if config.autopilot_path == "mock_adapter":
             adapter_rng = self._sensor_seeds.rng("autopilot_mock")
             self.autopilot_adapters = {
@@ -228,6 +239,30 @@ class FloodSearchMission:
                     telemetry_packet_loss_prob=config.autopilot_telemetry_packet_loss_prob,
                     telemetry_stale_timeout_s=config.autopilot_telemetry_stale_timeout_s,
                     rng=adapter_rng,
+                )
+                for i in range(config.num_drones)
+            }
+            for adapter in self.autopilot_adapters.values():
+                adapter.connect()
+        elif config.autopilot_path == "fake_sitl":
+            adapter_rng = self._sensor_seeds.rng("autopilot_sitl")
+            self.sitl_transport = FakeSITLTransport(
+                vehicle_ids=self._drone_ids, operating_frame=Frame.LOCAL_ENU,
+                command_latency_s=config.autopilot_command_latency_s,
+                telemetry_latency_s=config.autopilot_telemetry_latency_s,
+                command_packet_loss_prob=config.autopilot_command_packet_loss_prob,
+                telemetry_packet_loss_prob=config.autopilot_telemetry_packet_loss_prob,
+                telemetry_stale_timeout_s=config.autopilot_telemetry_stale_timeout_s,
+                ack_timeout_s=config.sitl_ack_timeout_s,
+                future_tolerance_s=config.sitl_future_tolerance_s,
+                rng=adapter_rng,
+            )
+            self.sitl_transport.start()
+            self.autopilot_adapters = {
+                i: SITLAdapter(
+                    vehicle_id=self._drone_ids[i],
+                    namespace=self.sitl_transport.registry.namespace_of(self._drone_ids[i]),
+                    transport=self.sitl_transport, operating_frame=Frame.LOCAL_ENU,
                 )
                 for i in range(config.num_drones)
             }
@@ -880,13 +915,16 @@ class FloodSearchMission:
                         "contact_status": bool(mission_context.contact_detected),
                     })
 
-                    # Phase 6: adapter boundary (swarm_sim/autopilot/) - see
-                    # docs/PHASE6_AUTOPILOT_ADAPTERS.md. Only runs on an
+                    # Phase 6/7: adapter boundary (swarm_sim/autopilot/,
+                    # swarm_sim/sitl/) - see docs/PHASE6_AUTOPILOT_ADAPTERS.md
+                    # and docs/PHASE7_SITL_INTEGRATION.md. Only runs on an
                     # ACCEPTED safety decision (there is a real, validated
                     # Command to forward); "direct" keeps the pre-Phase-6
                     # behavior (safe_vel unchanged) as a temporary
-                    # comparison baseline only.
-                    if cfg.autopilot_path == "mock_adapter" and decision.accepted:
+                    # comparison baseline only. The helper call itself is
+                    # identical for "mock_adapter" and "fake_sitl" - see
+                    # __init__'s own comment on self.autopilot_adapters.
+                    if cfg.autopilot_path in ("mock_adapter", "fake_sitl") and decision.accepted:
                         safe_vel = self._send_to_autopilot_adapter(i, own_state, decision.filtered_command, t)
 
                 target_vel, applied_speed = self.speed_ctrl.to_velocity_command(i, safe_vel)
@@ -1029,4 +1067,16 @@ class FloodSearchMission:
             "adapter_mode_transition_count": self._adapter_mode_transition_count,
             "adapter_failsafe_transition_count": self._adapter_failsafe_transition_count,
             "adapter_cpu_time_s": self._adapter_cpu_time_s,
+            # Phase 7 SITL integration boundary - see docs/PHASE7_SITL_INTEGRATION.md.
+            # Rich per-vehicle detail (command/telemetry/ack/failure history)
+            # lives on self.sitl_transport itself for scripts/tests to read
+            # directly (mirrors how self.distributed_consensus is exposed
+            # above) - these are just the summary counters.
+            "sitl_transport_running": (self.sitl_transport.is_running if self.sitl_transport else None),
+            "sitl_command_history_count": (
+                self.sitl_transport.total_command_history_count() if self.sitl_transport else None
+            ),
+            "sitl_failure_log_count": (
+                self.sitl_transport.total_failure_log_count() if self.sitl_transport else None
+            ),
         }

@@ -26,6 +26,17 @@ from .mock import MockAdapter
 from .px4 import PX4AdapterSkeleton
 from .types import AdapterCommand, AdapterResult, AutopilotMode, ConnectionState, VehicleTelemetry
 
+# Phase 7's SITLAdapter/ArduPilotSITLAdapterSkeleton/PX4SITLAdapterSkeleton
+# (swarm_sim/autopilot/sitl.py, ardupilot_sitl.py, px4_sitl.py) are
+# deliberately NOT re-exported here. swarm_sim.sitl.commands/telemetry
+# import from swarm_sim.autopilot.types, and importing swarm_sim.autopilot.*
+# always runs this __init__.py first - if this file also imported .sitl
+# eagerly, importing swarm_sim.sitl before swarm_sim.autopilot would
+# recurse back into a still-initializing swarm_sim.sitl.commands module
+# (a genuine circular import, not just an ordering nuisance - see
+# docs/PHASE7_SITL_INTEGRATION.md). Import them directly instead:
+# `from swarm_sim.autopilot.sitl import SITLAdapter`, etc.
+
 __all__ = [
     "AutopilotAdapter",
     "OfflineSkeletonAdapter",
