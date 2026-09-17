@@ -34,6 +34,10 @@ from gym_pybullet_drones.utils.utils import sync
 
 from . import distributed_consensus as dconsensus
 from . import sensors
+from .autopilot import AdapterCommand as AutopilotAdapterCommand
+from .autopilot import ConnectionState as AutopilotConnectionState
+from .autopilot import MockAdapter
+from .autopilot import VehicleTelemetry as AutopilotVehicleTelemetry
 from .consensus import ConsensusBoard
 from .contracts import CommandType, Frame, GeofenceSpec, HealthState, SensorObservation, VehicleState
 from .controller import SwarmController
@@ -205,6 +209,40 @@ class FloodSearchMission:
             self._drone_ids, config.consensus_quorum, config.consensus_cluster_radius,
             config.consensus_window_sec,
         )
+
+        # Phase 6: autopilot adapter boundary (swarm_sim/autopilot/) - see
+        # docs/PHASE6_AUTOPILOT_ADAPTERS.md. "mock_adapter" (default) is
+        # the architectural reference path: every safety-evaluated Command
+        # additionally passes through MockAdapter.send_command() before
+        # reaching PyBullet. "direct" is the pre-Phase-6 path, kept only
+        # as a temporary comparison baseline - see run()'s per-drone loop.
+        self.autopilot_adapters = {}
+        if config.autopilot_path == "mock_adapter":
+            adapter_rng = self._sensor_seeds.rng("autopilot_mock")
+            self.autopilot_adapters = {
+                i: MockAdapter(
+                    vehicle_id=self._drone_ids[i], operating_frame=Frame.LOCAL_ENU,
+                    command_latency_s=config.autopilot_command_latency_s,
+                    telemetry_latency_s=config.autopilot_telemetry_latency_s,
+                    command_packet_loss_prob=config.autopilot_command_packet_loss_prob,
+                    telemetry_packet_loss_prob=config.autopilot_telemetry_packet_loss_prob,
+                    telemetry_stale_timeout_s=config.autopilot_telemetry_stale_timeout_s,
+                    rng=adapter_rng,
+                )
+                for i in range(config.num_drones)
+            }
+            for adapter in self.autopilot_adapters.values():
+                adapter.connect()
+        self._adapter_sequence = {i: 0 for i in range(config.num_drones)}
+        self._adapter_candidate_count = 0
+        self._adapter_accepted_count = 0
+        self._adapter_rejected_count = 0
+        self._adapter_reject_reasons = {}
+        self._adapter_stale_telemetry_count = 0
+        self._adapter_replayed_command_count = 0
+        self._adapter_mode_transition_count = 0
+        self._adapter_failsafe_transition_count = 0
+        self._adapter_cpu_time_s = 0.0
 
         # Scenario-report bookkeeping (scoring/evaluation only - see run()).
         self._true_positive_detections = 0
@@ -513,6 +551,59 @@ class FloodSearchMission:
             return True
         return bool(p.getContactPoints(bodyB=body_id, physicsClientId=client))
 
+    def _send_to_autopilot_adapter(self, i, own_state, cmd, t):
+        """Phase 6: routes an already safety-evaluated `contracts.Command`
+        through drone i's `AutopilotAdapter` (see swarm_sim/autopilot/) -
+        the last gate before a velocity setpoint can reach PyBullet when
+        `cfg.autopilot_path == "mock_adapter"`. Only ever called with
+        `cmd` = `decision.filtered_command` (an ACCEPTED SafetyDecision's
+        own output) - never the raw SwarmController candidate `desired_vel`
+        (see tests/test_autopilot_architecture.py). Returns the velocity
+        to actually apply this tick (np.zeros(3) on any adapter
+        rejection)."""
+        adapter = self.autopilot_adapters[i]
+        telemetry = AutopilotVehicleTelemetry(
+            vehicle_id=self._drone_ids[i], timestamp_s=t, frame=Frame.LOCAL_ENU,
+            position_m=own_state.position_m, velocity_mps=own_state.velocity_mps,
+            acceleration_mps2=own_state.acceleration_mps2, attitude_rad=own_state.attitude_rad,
+            angular_velocity_radps=own_state.angular_velocity_radps, battery_fraction=own_state.battery_fraction,
+            estimator_valid=own_state.estimator_valid, connection_state=adapter.state, autopilot_mode=adapter.mode,
+            armed=adapter.armed, failsafe=adapter.failsafe, sequence=self._adapter_sequence[i],
+        )
+        adapter.push_ground_truth_state(telemetry)
+
+        sequence = self._adapter_sequence[i]
+        self._adapter_sequence[i] += 1
+        adapter_command = AutopilotAdapterCommand(command=cmd, sequence=sequence)
+        prev_mode, prev_state = adapter.mode, adapter.state
+
+        adapter_t0 = timemod.perf_counter()
+        result = adapter.send_command(adapter_command)
+        self._adapter_cpu_time_s += timemod.perf_counter() - adapter_t0
+
+        self._adapter_candidate_count += 1
+        if result.accepted:
+            self._adapter_accepted_count += 1
+            transformed = result.transformed_command.command
+            if transformed.command_type == CommandType.VELOCITY_SETPOINT:
+                vel = np.array(transformed.desired_velocity_mps)
+            else:
+                vel = np.zeros(3)
+        else:
+            self._adapter_rejected_count += 1
+            self._adapter_reject_reasons[result.reason] = self._adapter_reject_reasons.get(result.reason, 0) + 1
+            if result.reason == "stale_telemetry":
+                self._adapter_stale_telemetry_count += 1
+            if result.reason in ("sequence_replayed_conflicting", "sequence_replayed_stale"):
+                self._adapter_replayed_command_count += 1
+            vel = np.zeros(3)
+
+        if adapter.mode != prev_mode:
+            self._adapter_mode_transition_count += 1
+        if adapter.state != prev_state and AutopilotConnectionState.FAILSAFE in (adapter.state, prev_state):
+            self._adapter_failsafe_transition_count += 1
+        return vel
+
     def _classify_and_log_contacts(self, t, positions, velocities, tick_neighbor_obs, tick_range_returns,
                                      tick_safety_context):
         """SCORING/EVALUATION ONLY. Classifies every PyBullet-verified
@@ -789,6 +880,15 @@ class FloodSearchMission:
                         "contact_status": bool(mission_context.contact_detected),
                     })
 
+                    # Phase 6: adapter boundary (swarm_sim/autopilot/) - see
+                    # docs/PHASE6_AUTOPILOT_ADAPTERS.md. Only runs on an
+                    # ACCEPTED safety decision (there is a real, validated
+                    # Command to forward); "direct" keeps the pre-Phase-6
+                    # behavior (safe_vel unchanged) as a temporary
+                    # comparison baseline only.
+                    if cfg.autopilot_path == "mock_adapter" and decision.accepted:
+                        safe_vel = self._send_to_autopilot_adapter(i, own_state, decision.filtered_command, t)
+
                 target_vel, applied_speed = self.speed_ctrl.to_velocity_command(i, safe_vel)
                 # Anchor altitude via real position feedback (z held at flight_altitude);
                 # x/y are left to pure velocity tracking so the swarm behavior drives motion.
@@ -918,4 +1018,15 @@ class FloodSearchMission:
             "distributed_pending_evidence_count": sum(
                 n.pending_evidence_count() for n in self.distributed_consensus.nodes.values()
             ),
+            # Phase 6 autopilot adapter boundary - see docs/PHASE6_AUTOPILOT_ADAPTERS.md.
+            "autopilot_path": cfg.autopilot_path,
+            "adapter_candidate_count": self._adapter_candidate_count,
+            "adapter_accepted_count": self._adapter_accepted_count,
+            "adapter_rejected_count": self._adapter_rejected_count,
+            "adapter_reject_reasons": dict(self._adapter_reject_reasons),
+            "adapter_stale_telemetry_count": self._adapter_stale_telemetry_count,
+            "adapter_replayed_command_count": self._adapter_replayed_command_count,
+            "adapter_mode_transition_count": self._adapter_mode_transition_count,
+            "adapter_failsafe_transition_count": self._adapter_failsafe_transition_count,
+            "adapter_cpu_time_s": self._adapter_cpu_time_s,
         }

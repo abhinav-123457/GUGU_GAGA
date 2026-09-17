@@ -160,6 +160,20 @@ class MissionConfig:
     safety_link_timeout_s: float = 1.0
     safety_lost_agent_timeout_s: float = 5.0
 
+    # Phase 6: autopilot adapter boundary (swarm_sim/autopilot/). "direct"
+    # is the pre-Phase-6 simulator path (safety-evaluated command straight
+    # to speed control), kept only as a temporary comparison baseline -
+    # see docs/PHASE6_AUTOPILOT_ADAPTERS.md. "mock_adapter" is the
+    # architectural reference path: every command additionally passes
+    # through AutopilotAdapter.send_command() (frame/sequence/freshness/
+    # connection-state validated) before reaching PyBullet.
+    autopilot_path: str = "mock_adapter"     # "mock_adapter" | "direct"
+    autopilot_command_latency_s: float = 0.0
+    autopilot_telemetry_latency_s: float = 0.0
+    autopilot_command_packet_loss_prob: float = 0.0
+    autopilot_telemetry_packet_loss_prob: float = 0.0
+    autopilot_telemetry_stale_timeout_s: float = 1.0
+
     # Simulation
     duration_sec: float = 90.0
     control_freq_hz: int = 24
