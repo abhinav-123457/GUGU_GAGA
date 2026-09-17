@@ -16,9 +16,17 @@ with the identical seed and network/sensor config, so every metric is a
 direct A/B comparison - this IS the "comparison mode" required by Phase 5
 requirement 14 (same seed, same sensor reports, same network configuration).
 
+A 12th scenario, extreme_comm_partition_radius_3m, is a deliberately
+labeled NON-ACCEPTANCE stress scenario - see its own docstring and
+docs/PHASE5_DISTRIBUTED_CONSENSUS.md's "A pre-existing safety edge case"
+section. It always runs alongside the 11 (so it cannot be forgotten), but
+writes to a separate results file and is never counted toward the
+centralized-vs-distributed comparison.
+
 Usage:
-    python scripts/run_phase5_consensus_scenarios.py                  # all 11
+    python scripts/run_phase5_consensus_scenarios.py                  # all 11 + the stress scenario
     python scripts/run_phase5_consensus_scenarios.py perfect_communication
+    python scripts/run_phase5_consensus_scenarios.py extreme_comm_partition_radius_3m
 """
 import json
 import os
@@ -244,6 +252,116 @@ def scenario_obstacle_wedging():
     ), base={"seed": 42})
 
 
+# --- non-acceptance stress scenario -----------------------------------------
+# See docs/PHASE5_DISTRIBUTED_CONSENSUS.md's "A pre-existing safety edge
+# case" section for the full investigation this scenario documents.
+# Deliberately kept OUT of SCENARIOS (the primary Phase 5 acceptance
+# comparison) and written to a separate results file (see main()) so it
+# can never be mistaken for evidence of a distributed-consensus defect,
+# while still running by default so it cannot quietly disappear.
+
+STRESS_SEEDS = (1, 2, 3, 4, 5, 6, 7)
+
+STRESS_CONFIG = dict(
+    communication_radius=3.0, comm_dropout_base=0.02, comm_dropout_at_max_range=0.3, comm_latency_steps=2,
+)
+
+
+def _min_altitude_m(mission):
+    log = mission.telemetry.log
+    return min((entry["z"] for entry in log), default=None)
+
+
+def _run_stress_one(mode, seed):
+    cfg_kwargs = dict(BASE)
+    cfg_kwargs.update(STRESS_CONFIG)
+    cfg_kwargs["consensus_mode"] = mode
+    cfg_kwargs["seed"] = seed
+    cfg = MissionConfig(**cfg_kwargs)
+    mission = FloodSearchMission(cfg)
+    result = mission.run()
+    diag = result["diagnostics"]
+    return {
+        "seed": seed,
+        "mode": mode,
+        "configuration": dict(cfg_kwargs),
+        "victims_found": result["victims_found"],
+        "total_victims": result["total_victims"],
+        "drone_ground_contact_count": diag.get("drone_ground_contact_count"),
+        "drone_obstacle_contact_count": diag["drone_obstacle_contact_count"],
+        "drone_drone_contact_count": diag["drone_drone_contact_count"],
+        "safety_state_counts": result["safety_state_counts"],
+        "safety_override_count": result["safety_override_count"],
+        "min_altitude_m": _min_altitude_m(mission),
+        "min_ground_truth_clearance_m": result["min_ground_truth_clearance_m"],
+        "min_ground_truth_obstacle_clearance_m": result["min_ground_truth_obstacle_clearance_m"],
+        "swarm_connectivity_fraction": result["swarm_connectivity_fraction"],
+    }
+
+
+def scenario_extreme_comm_partition_radius_3m():
+    """NON-ACCEPTANCE STRESS SCENARIO - not part of the Phase 5
+    centralized-vs-distributed acceptance comparison. Reruns the exact
+    config that first surfaced a severe ground-contact spike
+    (communication_radius=3.0 - below every Couzin flocking zone radius:
+    r_repulsion=2.5, r_orientation=4.0, r_attraction=6.0, see
+    swarm_sim/config.py) across the same 7 seeds used to characterize it,
+    in BOTH consensus modes, so the "reproducible in either mode,
+    seed-dependently" finding is an inspectable artifact, not only prose.
+
+    Labels (carry these whenever this result is cited):
+      - known pre-existing Phase 4.1 safety limitation
+      - not a distributed-consensus defect
+      - not a safe-flight result
+    """
+    runs = [_run_stress_one(mode, seed) for seed in STRESS_SEEDS for mode in ("centralized", "distributed")]
+
+    by_seed = {}
+    for r in runs:
+        by_seed.setdefault(r["seed"], {})[r["mode"]] = r
+
+    compared_fields = ("drone_ground_contact_count", "drone_obstacle_contact_count",
+                        "drone_drone_contact_count", "victims_found")
+    mode_comparison_by_seed = []
+    for seed in sorted(by_seed):
+        c, d = by_seed[seed]["centralized"], by_seed[seed]["distributed"]
+        differing = [f for f in compared_fields if c[f] != d[f]]
+        mode_comparison_by_seed.append({
+            "seed": seed,
+            "result": "identical" if not differing else "different",
+            "differing_fields": differing,
+            "centralized_ground_contacts": c["drone_ground_contact_count"],
+            "distributed_ground_contacts": d["drone_ground_contact_count"],
+        })
+
+    return {
+        "scenario": "extreme_comm_partition_radius_3m",
+        "classification": "NON-ACCEPTANCE STRESS SCENARIO",
+        "labels": [
+            "known pre-existing Phase 4.1 safety limitation",
+            "not a distributed-consensus defect",
+            "not a safe-flight result",
+        ],
+        "do_not_count_as_phase5_evidence": True,
+        "base_config": {k: v for k, v in BASE.items() if k != "seed"},
+        "network_config": STRESS_CONFIG,
+        "seeds_tested": list(STRESS_SEEDS),
+        "runs": runs,
+        "mode_comparison_by_seed": mode_comparison_by_seed,
+        "summary": (
+            "Ground contacts occur in BOTH centralized and distributed modes, "
+            "seed-dependently, at this radius (below every Couzin flocking "
+            "zone radius) - confirming this is a pre-existing SafetySupervisor "
+            "limitation (cannot instantly zero a large existing horizontal "
+            "velocity when the Phase 4.1 critical-altitude tier fires), not "
+            "something distributed consensus introduces. safety_supervisor.py "
+            "is out of scope for Phase 5; this scenario is retained as a "
+            "visible, labeled stress case for a future safety-focused phase, "
+            "not retuned away."
+        ),
+    }
+
+
 SCENARIOS = {
     "perfect_communication": scenario_perfect_communication,
     "moderate_packet_loss": scenario_moderate_packet_loss,
@@ -258,17 +376,38 @@ SCENARIOS = {
     "obstacle_wedging": scenario_obstacle_wedging,
 }
 
+# Kept separate from SCENARIOS deliberately - see scenario_extreme_comm_partition_radius_3m's
+# docstring and docs/PHASE5_DISTRIBUTED_CONSENSUS.md.
+STRESS_SCENARIOS = {
+    "extreme_comm_partition_radius_3m": scenario_extreme_comm_partition_radius_3m,
+}
+
+ALL_SCENARIOS = {**SCENARIOS, **STRESS_SCENARIOS}
+
 
 def main():
-    names = [n for n in sys.argv[1:] if not n.startswith("-")] or list(SCENARIOS.keys())
+    requested = [n for n in sys.argv[1:] if not n.startswith("-")]
+    # Default (no args): every primary scenario AND the stress scenario -
+    # the stress scenario must never be something you have to remember to
+    # ask for separately.
+    names = requested or (list(SCENARIOS.keys()) + list(STRESS_SCENARIOS.keys()))
     os.makedirs(OUT_DIR, exist_ok=True)
-    all_results = []
+    primary_results = []
+    stress_results = []
     for name in names:
-        d = SCENARIOS[name]()
+        d = ALL_SCENARIOS[name]()
         print(json.dumps(d, default=str), flush=True)
-        all_results.append(d)
-    with open(os.path.join(OUT_DIR, "phase5_scenario_results.json"), "w") as f:
-        json.dump(all_results, f, indent=2, default=str)
+        (stress_results if name in STRESS_SCENARIOS else primary_results).append(d)
+
+    # Two separate output files, on purpose: the stress scenario must
+    # never be silently averaged/aggregated into the primary Phase 5
+    # centralized-vs-distributed acceptance numbers.
+    if primary_results:
+        with open(os.path.join(OUT_DIR, "phase5_scenario_results.json"), "w") as f:
+            json.dump(primary_results, f, indent=2, default=str)
+    if stress_results:
+        with open(os.path.join(OUT_DIR, "phase5_stress_scenario_results.json"), "w") as f:
+            json.dump(stress_results, f, indent=2, default=str)
 
 
 if __name__ == "__main__":

@@ -84,12 +84,16 @@ obstacle/drone positions. `SwarmController` itself never receives ground
 truth at all now - enforced by both a static guard and a behavioral test,
 see `docs/PHASE2_SENSING.md`.
 
-This is bookkeeping-level consensus (`ConsensusBoard` sees all reports
-directly, the same way `RecruitmentBoard` already worked), not a
-peer-to-peer protocol where each drone carries its own belief state and
-reports only propagate through `CommsNetwork` messages. That's the natural
-next step if you want the consensus mechanism itself to be subject to the
-same packet-loss/latency realism as flocking already is.
+This description is `ConsensusBoard`, the original centralized
+implementation - still available and unmodified, selectable with
+`--consensus-mode centralized`. The default (`--consensus-mode
+distributed`) instead runs a peer-to-peer protocol
+(`swarm_sim/distributed_consensus.py`): each drone carries its own
+private belief state, and detection reports/confirmations propagate only
+through `CommsNetwork` messages, subject to the same range/packet-loss/
+latency realism flocking already has - see
+`docs/PHASE5_DISTRIBUTED_CONSENSUS.md` for the full protocol, message
+schema, and a centralized-vs-distributed comparison across 11 scenarios.
 
 Physics comes from [`gym-pybullet-drones`](https://github.com/utiasDSL/gym-pybullet-drones)
 (`CtrlAviary` + `DSLPIDControl`, driven directly rather than through its
@@ -136,6 +140,7 @@ Key options:
 - `--max-speed`, `--cruise-speed` - per-run speed caps (m/s); `SpeedController.set_max_speed(drone_id, mps)` also allows changing an individual drone's cap at runtime
 - `--comm-range`, `--packet-loss`, `--comm-latency` - stress the UAV<->UAV network (radio range, loss probability at max range, message delay in control steps); watch `swarm_connectivity_fraction` in the summary and `num_neighbors` in the telemetry CSV respond
 - `--consensus-quorum` - how many independent drones must agree before a victim detection is confirmed (1 = old instant single-drone behavior)
+- `--consensus-mode {distributed,centralized}` - peer-local consensus over `CommsNetwork` (default) or the original centralized `ConsensusBoard`, for comparison - see `docs/PHASE5_DISTRIBUTED_CONSENSUS.md`
 - `--gui` - open the PyBullet viewer
 - `--out` - telemetry CSV path (every drone, every control step: position, velocity, speed, orientation, mode, neighbor count)
 
@@ -170,9 +175,32 @@ avoidance, and collision avoidance all go through range/FOV/noise/dropout/
 latency-limited sensor models now - but a drone's own position/velocity
 estimate is still perfect (no simulated GPS-denied localization/EKF drift
 on *own* state yet, even though the paper folder this project started from
-is full of exactly that literature), there's still no independent safety
-supervisor to catch a bad sensor reading (Phase 4), battery/endurance
-modeling doesn't exist, and nothing here has undergone regulatory/airspace
-compliance or safety certification appropriate to flying multiple aircraft
-near people. Treat this as the algorithm layer to build on, not the
-finished product.
+is full of exactly that literature), battery/endurance modeling doesn't
+exist, and nothing here has undergone regulatory/airspace compliance or
+safety certification appropriate to flying multiple aircraft near people.
+Treat this as the algorithm layer to build on, not the finished product.
+
+An independent safety supervisor (`swarm_sim/safety_supervisor.py`, see
+`docs/PHASE4_SAFETY.md`/`docs/PHASE5_DISTRIBUTED_CONSENSUS.md`) sits
+between every candidate command and PyBullet, and victim-detection
+confirmation can run either through the original centralized
+`ConsensusBoard` or a peer-local distributed-consensus protocol over
+`CommsNetwork` (`--consensus-mode`, see `docs/PHASE5_DISTRIBUTED_CONSENSUS.md`).
+
+**Known safety limitation (pre-existing, not distributed-consensus-
+specific):** at an unrealistically small `--comm-range` (below the
+flocking zone radii, e.g. 3m against Couzin's default 2.5/4.0/6.0m
+zones), flocking loses all usable neighbor data and a drone can reach a
+large horizontal velocity before the safety supervisor's critical-
+altitude recovery tier engages; that tier cannot instantly zero an
+existing horizontal velocity, so the vehicle can graze the ground
+repeatedly while decelerating. Verified seed-dependent in **both**
+centralized and distributed consensus modes (it is a `SafetySupervisor`
+limitation, not a consensus-mode defect) - see
+`scripts/run_phase5_consensus_scenarios.py`'s
+`extreme_comm_partition_radius_3m` stress scenario and
+`docs/PHASE5_DISTRIBUTED_CONSENSUS.md`'s "A pre-existing safety edge
+case" section for the full investigation and reproducible numbers. Not
+fixed here (`safety_supervisor.py` was out of scope for Phase 5); a
+realistic `--comm-range` (>= the flocking zone radii) does not trigger it
+in any seed tested.

@@ -324,6 +324,53 @@ regression scenario - confirming no new ground-contact regression;
 Phase 4.1's own reported result exactly (`docs/PHASE4_SAFETY.md`);
 `deterministic_replay_result` is "identical" in all 11.
 
+The 12th, non-acceptance stress scenario (`extreme_comm_partition_radius_3m`)
+is reported separately - see "A pre-existing safety edge case" below, not
+this table.
+
+### Reproducible environment
+
+Exact environment this phase's numbers (and the regression suite) were
+produced on - restated here so this document is self-contained and does
+not require cross-referencing `README.md`'s `Setup` section to reproduce:
+
+- **Python**: 3.12.10 (`gym-pybullet-drones` requires >=3.12; `pybullet`
+  has no prebuilt wheel for newer Python releases yet, so it compiles
+  from source - see `README.md`'s `Setup` for the dev-header implication).
+- **PyBullet**: installed transitively as `gym-pybullet-drones`'s own
+  dependency, via `pip install -r requirements.txt` (pinned versions in
+  that file) - not installed standalone or pinned separately. Resolved
+  version this phase ran against: `pybullet==3.2.7`.
+- **gym-pybullet-drones**: vendored as its own upstream git checkout at
+  `third_party/gym-pybullet-drones` (not tracked inside this repo - see
+  `.gitignore`), pinned to commit
+  `7ebad1ecabd28a7000add2d05f888aa2e837c2cc` from
+  `https://github.com/utiasDSL/gym-pybullet-drones`, installed editable
+  with `pip install -e third_party/gym-pybullet-drones --no-deps`.
+  Resolved package version: `2.2.0`.
+- **Full setup**, verbatim from `README.md`:
+  ```bash
+  git clone https://github.com/utiasDSL/gym-pybullet-drones third_party/gym-pybullet-drones
+  git -C third_party/gym-pybullet-drones checkout 7ebad1ecabd28a7000add2d05f888aa2e837c2cc
+
+  py -3.12 -m venv .venv
+  ./.venv/Scripts/python.exe -m pip install -r requirements.txt
+  ./.venv/Scripts/python.exe -m pip install -e third_party/gym-pybullet-drones --no-deps
+  ./.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+  ```
+- **Command used to run the full regression suite** (compile check, then
+  every test - this is exactly the "Run" instruction for this phase):
+  ```bash
+  python -m compileall -q swarm_sim run_mission.py tests
+  python -m pytest -q tests
+  ```
+- **Command used to (re)generate every number in this document's Results
+  tables** (both the primary 11-scenario comparison and the stress
+  scenario, ~10-15 minutes on a CPU-only laptop):
+  ```bash
+  python scripts/run_phase5_consensus_scenarios.py
+  ```
+
 ### Regression tests
 
 - `python -m compileall -q swarm_sim run_mission.py tests`: clean.
@@ -375,6 +422,12 @@ rise, not just true-positive recall falling), not a hidden defect.
 
 ### A pre-existing safety edge case, found and deliberately not fixed here
 
+**Status: known pre-existing Phase 4.1 safety limitation. Not a
+distributed-consensus defect. Not a safe-flight result.** Reviewed and
+conditionally accepted with this scenario required to stay visible rather
+than disappear through retuning - see `extreme_comm_partition_radius_3m`
+below.
+
 The first `communication_partition` draft used `communication_radius=3.0`
 (below every Couzin flocking zone radius - `r_repulsion=2.5`,
 `r_orientation=4.0`, `r_attraction=6.0`). That produced a severe
@@ -415,14 +468,52 @@ pre-existing edge case - it does not change whether the edge case exists.
 **Action taken**: `safety_supervisor.py` is explicitly out of scope this
 phase ("Do not modify: safety_supervisor.py behavior or thresholds").
 Rather than report a scenario that gratuitously exercises an out-of-scope
-defect, `communication_partition`/`partition_healing` were retuned to
-`communication_radius` >= 6.5 (above every flocking zone radius) -
+defect, `communication_partition`/`partition_healing` (the two scenarios
+in the primary, acceptance-relevant 11-scenario comparison) were retuned
+to `communication_radius` >= 6.5 (above every flocking zone radius) -
 verified safe (0 ground contacts, both modes) across 7 seeds at both 6.5
 and 7.0 - while still producing genuine, substantial partitioning
 (connectivity fraction as low as 0.0-0.12 at these radii, depending on
-seed). The 3.0 finding is recorded here rather than discarded, since it
-is a real, reproducible limitation worth a future safety-focused phase
-picking up.
+seed).
+
+**The 3.0 finding is not discarded through that retuning.** Per
+reviewer follow-up, it is kept as its own permanent, reproducible,
+explicitly-labeled artifact:
+`scripts/run_phase5_consensus_scenarios.py::scenario_extreme_comm_partition_radius_3m`
+- a 12th scenario, deliberately excluded from `SCENARIOS` (the primary
+comparison) and written to its own results file
+(`results/phase5_scenarios/phase5_stress_scenario_results.json`) so it
+can never be aggregated into or mistaken for Phase 5 acceptance evidence,
+but always runs by default (never opt-in only) so it cannot quietly stop
+being reported either. It reruns the exact `communication_radius=3.0`
+config across the same 7 seeds in both consensus modes and records, per
+seed per mode: the exact configuration, ground/obstacle/drone-drone
+contact counts, victims found, the safety-state histogram, the safety
+override count, minimum altitude reached, minimum clearances, and an
+explicit `identical`/`different` verdict between modes for that seed.
+
+Representative results (see the JSON file for the full 7-seed/2-mode
+table):
+
+| seed | centralized ground contacts | distributed ground contacts | mode result | differing fields |
+|---|---|---|---|---|
+| 1 | 0 | 0 | identical | - |
+| 2 | 0 | 0 | different | victims_found only (normal trajectory divergence - see the `np.mean` finding above; not a ground-contact difference) |
+| 3 | 284 | 297 | different | drone_ground_contact_count, victims_found (both modes severely affected) |
+| 4 | 97 | 6 | different | drone_ground_contact_count (both modes nonzero) |
+| 5 | 0 | 0 | identical | - |
+| 6 | 0 | 0 | identical | - |
+| 7 | 0 | 175 | different | drone_ground_contact_count, drone_obstacle_contact_count |
+
+This table (`mode_comparison_by_seed` in the JSON output) is the
+artifact-level evidence for the claim above: ground contacts appear in
+**both** modes, seed-dependently - sometimes only centralized (seed 4,
+partially), sometimes only distributed (seed 7), sometimes both severely
+(seed 3), sometimes neither (seeds 1/5/6). There is no seed at which
+distributed is uniquely or consistently worse. This is a real,
+reproducible `SafetySupervisor` limitation worth a future safety-focused
+phase picking up - it is not evidence of a Phase 5 distributed-consensus
+failure, and must not be counted as such.
 
 ## Remaining risks
 
