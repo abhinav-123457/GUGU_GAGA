@@ -32,6 +32,7 @@ from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 from gym_pybullet_drones.utils.enums import DroneModel, Physics
 from gym_pybullet_drones.utils.utils import sync
 
+from . import distributed_consensus as dconsensus
 from . import sensors
 from .consensus import ConsensusBoard
 from .contracts import CommandType, Frame, GeofenceSpec, HealthState, SensorObservation, VehicleState
@@ -86,7 +87,13 @@ class FloodSearchMission:
         self.telemetry = TelemetryHub()
         self.board = RecruitmentBoard(decay_rate=config.beacon_decay_rate)
         self.network = CommsNetwork(config, config.num_drones, self.rng)
+        # Reference/comparison implementation - kept unmodified (Phase 5
+        # requirement 13). Constructed unconditionally so scripts/tests can
+        # always compare it against the distributed path below, regardless
+        # of which one config.consensus_mode actually drives this mission.
         self.consensus = ConsensusBoard(config)
+        self._drone_ids = tuple(f"drone{i}" for i in range(config.num_drones))
+        self._drone_index = {did: i for i, did in enumerate(self._drone_ids)}
         self.false_confirmations = 0
         self._connected_steps = 0
         self._connectivity_checks = 0
@@ -186,6 +193,17 @@ class FloodSearchMission:
         )
         self.neighbor_sensor = NeighborSensorModel(
             config, config.num_drones, self._sensor_seeds.rng("neighbor_sensor"),
+        )
+
+        # Phase 5: peer-local distributed consensus (swarm_sim/distributed_consensus.py).
+        # Its own message-dropout RNG stream is deliberately separate from
+        # self.network.rng (see network.py's CommsNetwork.__init__ docstring)
+        # so enabling/disabling it never perturbs the position-broadcast
+        # dropout sequence flocking depends on.
+        self.network.message_rng = self._sensor_seeds.rng("distributed_consensus_network")
+        self.distributed_consensus = dconsensus.DistributedConsensus(
+            self._drone_ids, config.consensus_quorum, config.consensus_cluster_radius,
+            config.consensus_window_sec,
         )
 
         # Scenario-report bookkeeping (scoring/evaluation only - see run()).
@@ -360,6 +378,62 @@ class FloodSearchMission:
         changed."""
         for candidate in detections:
             self.consensus.submit(drone_id, np.array(candidate.position_m), t)
+
+    def _submit_detections_distributed(self, drone_id, detections, t, positions):
+        """Phase 5 equivalent of _submit_detections: this drone's sensed
+        candidates (still never ground truth - same VictimSensorModel
+        output) go into ONLY its own private DroneConsensusNode, then get
+        broadcast (plus any evidence it's relaying on another drone's
+        behalf) over CommsNetwork's now-generic message channel - not into
+        any shared object. See docs/PHASE5_DISTRIBUTED_CONSENSUS.md."""
+        did = self._drone_ids[drone_id]
+        msg = self.distributed_consensus.outgoing_detection_message(did, detections, t)
+        if msg is not None:
+            self.network.send_message(drone_id, msg, positions)
+        if self.cfg.consensus_relay_enabled:
+            relay_msg = self.distributed_consensus.outgoing_relay_message(did, t)
+            if relay_msg is not None:
+                self.network.send_message(drone_id, relay_msg, positions)
+
+    def _resolve_confirmed_detections_distributed(self, t, positions):
+        """Phase 5 equivalent of _resolve_confirmed_detections: drains
+        every drone's own local quorum check (already deduplicated
+        globally by DistributedConsensus.try_confirm_all - several drones
+        independently reaching the same swarm-wide realization in the same
+        tick is expected and correct, and must be scored/announced once).
+        Ground truth (_match_victim) is read here ONLY to score a
+        confirmed centroid against the nearest still-missing victim -
+        identical use to the centralized path, just fed by a different
+        confirmation source."""
+        client = self.env.getPyBulletClient() if self.cfg.gui else None
+        self.diagnostics.record_consensus_report_snapshot(self._distributed_pending_reports_snapshot())
+        for drone_id, result, confirm_msg in self.distributed_consensus.try_confirm_all(t):
+            i = self._drone_index[drone_id]
+            self.network.send_message(i, confirm_msg, positions)
+            centroid = np.array(result.centroid_m)
+            vid = self._match_victim(centroid)
+            first_drone_idx = self._drone_index[result.contributing_drone_ids[0]]
+            if vid is not None:
+                self.victims_found.add(vid)
+                self.board.announce(vid, [centroid[0], centroid[1], self.cfg.flight_altitude], first_drone_idx, t)
+                if self.cfg.gui and vid < len(self._victim_bodies):
+                    p.changeVisualShape(self._victim_bodies[vid], -1, rgbaColor=[0.25, 0.85, 0.55, 1], physicsClientId=client)
+                self.diagnostics.record_confirmation(vid, centroid, t, len(result.contributing_drone_ids))
+            else:
+                self.false_confirmations += 1
+                self.diagnostics.record_false_confirmation(len(result.contributing_drone_ids))
+
+    def _distributed_pending_reports_snapshot(self):
+        """Adapts DistributedConsensus's per-node pending evidence into the
+        exact dict shape ConsensusBoard.reports already uses, so
+        MissionDiagnostics.record_consensus_report_snapshot (Phase 2,
+        unmodified) works identically for both consensus_mode values -
+        needed for a fair centralized-vs-distributed diagnostics
+        comparison. Evaluation-only; never fed back into a decision."""
+        return [
+            {"drone_id": r["drone_id"], "pos": np.array(r["pos"]), "t": r["t"]}
+            for r in self.distributed_consensus.pending_evidence_snapshot()
+        ]
 
     def _resolve_confirmed_detections(self, t):
         """Drain ConsensusBoard for anything newly confirmed this tick
@@ -619,7 +693,10 @@ class FloodSearchMission:
                     positions[i, :2], heading_xy, detections, already_found_mask,
                 )
                 consensus_t0 = timemod.perf_counter()
-                self._submit_detections(i, detections, t)
+                if cfg.consensus_mode == "distributed":
+                    self._submit_detections_distributed(i, detections, t, positions)
+                else:
+                    self._submit_detections(i, detections, t)
                 self.diagnostics.consensus_cpu_time_s += timemod.perf_counter() - consensus_t0
                 for matched_vid in matched_vids_for_candidates:
                     self.diagnostics.record_submission(matched_vid)
@@ -743,7 +820,14 @@ class FloodSearchMission:
                                        num_neighbors)
 
             consensus_t0 = timemod.perf_counter()
-            self._resolve_confirmed_detections(t)
+            if cfg.consensus_mode == "distributed":
+                self.network.pump_messages()
+                for i in range(cfg.num_drones):
+                    inbox = self.network.poll_inbox(i)
+                    self.distributed_consensus.deliver(self._drone_ids[i], inbox, t)
+                self._resolve_confirmed_detections_distributed(t, positions)
+            else:
+                self._resolve_confirmed_detections(t)
             self.diagnostics.consensus_cpu_time_s += timemod.perf_counter() - consensus_t0
 
             self._classify_and_log_contacts(t, positions, velocities, tick_neighbor_obs, tick_range_returns,
@@ -822,4 +906,16 @@ class FloodSearchMission:
             "safety_override_switch_count": self._safety_override_switch_count,
             "safety_longest_override_duration_s": self._safety_longest_override_duration_s,
             "safety_telemetry": self.safety_telemetry,
+            # Phase 5 distributed consensus - see docs/PHASE5_DISTRIBUTED_CONSENSUS.md.
+            "consensus_mode": cfg.consensus_mode,
+            "distributed_report_count": self.distributed_consensus.report_count,
+            "distributed_confirmed_victim_count": self.distributed_consensus.confirmed_victim_count(),
+            "distributed_duplicate_suppressed_count": self.distributed_consensus.total_duplicate_suppressed_count(),
+            "distributed_own_repeat_suppressed_count": self.distributed_consensus.total_own_repeat_suppressed_count(),
+            "distributed_stale_message_count": self.distributed_consensus.total_stale_message_count(),
+            "distributed_expired_evidence_count": self.distributed_consensus.total_expired_evidence_count(),
+            "distributed_quorum_failure_count": self.distributed_consensus.total_quorum_failure_count(),
+            "distributed_pending_evidence_count": sum(
+                n.pending_evidence_count() for n in self.distributed_consensus.nodes.values()
+            ),
         }

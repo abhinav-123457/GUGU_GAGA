@@ -26,6 +26,9 @@ def build_parser():
     parser.add_argument("--comm-latency", type=int, default=2, help="message latency, control steps")
     parser.add_argument("--consensus-quorum", type=int, default=2,
                          help="independent drones' reports required to confirm a detection")
+    parser.add_argument("--consensus-mode", choices=["distributed", "centralized"], default="distributed",
+                         help="distributed: peer-local consensus over CommsNetwork (Phase 5, default); "
+                              "centralized: reference ConsensusBoard implementation, for comparison")
     return parser
 
 
@@ -46,6 +49,7 @@ def main():
         comm_dropout_at_max_range=args.packet_loss,
         comm_latency_steps=args.comm_latency,
         consensus_quorum=args.consensus_quorum,
+        consensus_mode=args.consensus_mode,
     )
 
     mission = FloodSearchMission(cfg)
@@ -53,6 +57,7 @@ def main():
 
     print("\nMission summary:")
     print(f"  Flock model:        {cfg.flock_model}")
+    print(f"  Consensus mode:     {result['consensus_mode']}")
     print(f"  Victims found:      {result['victims_found']}/{result['total_victims']}")
     print(f"  False confirmations:{result['false_confirmations']:>3}  (independent reports that agreed on empty space)")
     print(f"  Swarm connectivity: {result['swarm_connectivity_fraction'] * 100:.1f}% of steps fully connected")

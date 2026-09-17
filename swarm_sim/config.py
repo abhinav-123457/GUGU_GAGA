@@ -64,6 +64,13 @@ class MissionConfig:
     consensus_cluster_radius: float = 3.0    # max spread among reports to count as the same detection
     consensus_window_sec: float = 10.0       # how long an unconfirmed report stays eligible
 
+    # Phase 5: peer-local distributed consensus (swarm_sim/distributed_consensus.py),
+    # replacing ConsensusBoard as the operative confirmation path.
+    # ConsensusBoard itself is kept, unmodified, as a reference/comparison
+    # implementation - see docs/PHASE5_DISTRIBUTED_CONSENSUS.md.
+    consensus_mode: str = "distributed"       # "distributed" | "centralized"
+    consensus_relay_enabled: bool = True      # one-hop CONSENSUS_EVIDENCE gossip beyond direct radio range
+
     # Phase 2 sensing: victim detection sensor (swarm_sim/sensors.py
     # VictimSensorModel). Replaces the old ground-truth-distance-gated
     # detection check - range/FOV/occlusion/noise/false-negative/
