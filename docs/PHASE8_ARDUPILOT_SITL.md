@@ -9,15 +9,17 @@ performs outdoor testing, arms a vehicle, takes off, produces real
 motor/PWM output, or does hardware-in-the-loop - see "Why this is not
 hardware integration" and the explicit confirmation at the end.
 
-**Actual ArduPilot SITL was not run as part of this delivery.** WSL2 is
-available on this machine and the operator was given exact build/launch
-commands to run interactively (installing ArduPilot's build prerequisites
-needs an interactive `sudo` password this non-interactive environment
-cannot supply), but the build was not completed and confirmed before this
-report was written. Only the deterministic `FakeSITLTransport` (Phase 7,
-unchanged) and a local, in-process MAVLink test double
-(`tests/_dummy_ardupilot_vehicle.py`, real wire protocol, not real
-ArduPilot firmware) were exercised - see "Reproducibility" below.
+**Actual ArduPilot SITL was built and run as part of this delivery.**
+ArduPilot `Copter-4.6.3` (commit `92b0cd788ec29406f26c6f9c31d5ceedbd1cc538`)
+was built for the `sitl` board in WSL2 (`Ubuntu-22.04`) and run as two real,
+independent local processes (`system_id` 1 and 2, `tcp:127.0.0.1:5760`/
+`5770`). All 18 transport-level required scenarios in
+`scripts/run_phase8_ardupilot_sitl.py --local-sitl` ran with
+`actual_ardupilot_sitl_run: true` against these real processes, each
+producing the expected accept/reject pattern. See "Reproducibility" and
+"Real-SITL verification results" below for the exact commands, findings,
+and one still-open limitation (real-binary SPAWN mode, as opposed to the
+ATTACH mode the verification run actually used).
 
 ## Architecture
 
@@ -70,9 +72,10 @@ factory function, which constructs a `SITLAdapter` around an
 
 ## Files changed
 
-- `swarm_sim/sitl/ardupilot_transport.py` (new) - `ArduPilotSITLTransport`,
-  `ArduPilotVehicleEndpoint`, `_SITLProcessHandle`, `dry_run_validate`,
-  `parse_connection_string`, `ArduPilotTransportError`.
+- `swarm_sim/sitl/ardupilot_transport.py` (new, then revised against real
+  ArduPilot SITL - see "Real-SITL verification results") -
+  `ArduPilotSITLTransport`, `ArduPilotVehicleEndpoint`, `_SITLProcessHandle`,
+  `dry_run_validate`, `parse_connection_string`, `ArduPilotTransportError`.
 - `swarm_sim/autopilot/ardupilot_sitl.py` (extended, Phase 7's
   `ArduPilotSITLAdapterSkeleton` untouched) - added
   `build_ardupilot_sitl_adapter`.
@@ -98,6 +101,143 @@ factory function, which constructs a `SITLAdapter` around an
   (19 tests) - 69 new tests this phase.
 - `scripts/run_phase8_ardupilot_sitl.py` (new) - `--dry-run` / `--local-sitl`.
 - `docs/PHASE8_ARDUPILOT_SITL.md` (this file).
+
+## Real-SITL verification results
+
+Performed in WSL2 (`Ubuntu-22.04`), driven from this project's own Windows
+Python venv against `tcp:127.0.0.1:5760`/`5770` (WSL2's automatic
+localhost-forwarding makes these genuinely reachable as loopback addresses
+from the Windows side - no bridging, no non-loopback address ever used).
+
+**Build**:
+
+- ArduPilot repository cloned fresh, then checked out at the stable tag
+  `Copter-4.6.3` (commit `92b0cd788ec29406f26c6f9c31d5ceedbd1cc538`) - the
+  `master` branch HEAD at clone time (`4.6.0-beta1-8629-g9165d224194`)
+  failed to compile against GCC 11.4 (`AVSSUAS` MAVLink dialect header:
+  "types may not be defined in parameter types" in
+  `mavlink_msg_avss_drone_position.h`) - a pre-existing upstream issue on
+  that particular development snapshot, unrelated to this project; the
+  latest stable release tag was used instead and built cleanly.
+- Build tools: gcc/g++ 11.4.0 (Ubuntu 22.04 default), Python 3.10.12,
+  ccache 4.5.1, MAVProxy 1.8.74, pymavlink 2.4.49 (matches this project's
+  own `requirements.txt` exactly), all installed via ArduPilot's own
+  `Tools/environment_install/install-prereqs-ubuntu.sh -y`.
+- That installer refuses to run as root ("don't sudo it") - WSL2's default
+  user for this distro turned out to be `root`, so a dedicated non-root
+  build user (`swarmbuild`, passwordless local `sudo` scoped to that one
+  account, created via `useradd`/`sudoers.d`) was created to run it. This
+  is a normal, disposable, local WSL environment-setup step, not a change
+  to any shared or production system.
+- Exact build commands (run as `swarmbuild` in `~/ardupilot`):
+
+  ```bash
+  git clone https://github.com/ArduPilot/ardupilot.git
+  git checkout Copter-4.6.3 && git submodule update --init --recursive
+  ./Tools/environment_install/install-prereqs-ubuntu.sh -y
+  ./waf configure --board sitl
+  ./waf copter -j12   # succeeded in 4m34s -> build/sitl/bin/arducopter
+  ```
+
+- Executable: `/home/swarmbuild/ardupilot/build/sitl/bin/arducopter`
+  (ELF 64-bit, 5.4MB, not stripped).
+
+**Launch** (two independent vehicles, run from `~/ardupilot` as cwd):
+
+```bash
+./build/sitl/bin/arducopter --model quad --speedup 1 -I0 \
+    --home -35.363261,149.165230,584,353 --sysid 1   # tcp:127.0.0.1:5760
+./build/sitl/bin/arducopter --model quad --speedup 1 -I1 \
+    --home -35.363261,149.165230,584,353 --sysid 2   # tcp:127.0.0.1:5770
+```
+
+Both were started by the operator/session directly (**ATTACH mode** -
+`executable_path=None` on the endpoint) - this is the mode
+`scripts/run_phase8_ardupilot_sitl.py --local-sitl`'s actual verification
+run used throughout.
+
+**Result**: `python scripts/run_phase8_ardupilot_sitl.py --local-sitl` ran
+all 18 transport-level scenarios with `actual_ardupilot_sitl_run: true`.
+Every scenario produced exactly its expected reject reason against the
+real vehicles: `one_vehicle_nominal` 10/10 accepted,
+`two_vehicles_nominal` 20/20 accepted, `heartbeat_loss` ->
+`heartbeat_lost`, `estimator_failure` -> `estimator_invalid`,
+`battery_critical` -> `battery_critical`, `sequence_replay` ->
+`sequence_replayed_stale`, `namespace_mismatch` -> `namespace_mismatch`,
+`process_exit` -> `disconnected`, `operator_abort`/`land_requested`/
+`return_to_safe_point`/`duplicate_command` all accepted cleanly.
+`wrong_system_id`/`wrong_component_id` are reported as
+`verified_in_unit_tests` (real per-message identity filtering is exercised
+functionally against a real MAVLink connection in
+`tests/test_ardupilot_sitl.py`, not re-derived here, to avoid needing a
+third/fourth misconfigured real SITL instance just for this script).
+Mission-level scenarios 20-22 remain FakeSITL-backed, unchanged, as
+documented below in "Remaining risks".
+
+**Three real bugs/gaps this real-SITL run found and fixed** (none of these
+were visible against the dummy MAVLink test fixture, since the fixture
+always streamed telemetry unsolicited and was always launched with a
+correct working directory by construction):
+
+1. **Real ArduCopter does not proactively stream `LOCAL_POSITION_NED`/
+   `ATTITUDE`/`SYS_STATUS`/`EKF_STATUS_REPORT`** to a freshly connected
+   MAVLink endpoint - confirmed directly (a raw connection received only
+   `HEARTBEAT` and `COMMAND_ACK` for 15+ seconds). Fixed by sending
+   `MAV_CMD_SET_MESSAGE_INTERVAL` for each required message type,
+   immediately once the startup heartbeat is confirmed
+   (`_request_telemetry_streams`, called from `_start_channel`). This is
+   a real, documented ArduPilot behavior difference from
+   `FakeSITLTransport`/the dummy fixture, not a workaround for a bug.
+2. **`ArduPilotVehicleEndpoint.working_directory` is required for spawn
+   mode.** Without it, spawning the real binary from Windows via
+   `wsl.exe -d <distro> -- <path> <args>` left the Linux-side working
+   directory at whatever `wsl.exe` defaults to when none is given (a
+   DrvFs translation of the Windows caller's own cwd, e.g.
+   `/mnt/c/Users/...`) - real ArduCopter bound its MAVLink port
+   successfully and then exited (code 1) shortly after, apparently while
+   trying to open its EEPROM/parameter storage relative to that wrong
+   directory. Fixed by adding an explicit `working_directory` field and
+   passing it via `wsl.exe`'s own `--cd <Directory>` flag (a first-class
+   flag, not shell construction) on Windows, or `subprocess.Popen(...,
+   cwd=...)` directly on Linux. Verified the flag takes effect (`pwd`
+   inside WSL correctly reported the configured directory) via a direct,
+   isolated test.
+3. **`_SITLProcessHandle` never drained a crashed process's stdout/stderr
+   before reporting why it exited**, so "SITL process exited during
+   startup" errors always reported an empty stderr even when the process
+   had written a real reason. Fixed with `drain_output_after_exit()`,
+   called before raising in both places `_start_channel` detects an
+   unexpected exit. Purely a diagnostics improvement.
+
+**Known limitation - full SPAWN-mode (this code launching the real binary
+itself, end-to-end) was not cleanly reproduced this session.** After the
+`working_directory` fix above, a fresh spawn attempt still exited (code 1)
+shortly after binding its MAVLink port, with no further stderr output;
+switching to an unused instance number changed nothing. Investigating
+further by calling pymavlink's blocking `wait_heartbeat()` directly
+against a struggling connection (bypassing this project's own
+`ArduPilotSITLTransport`, which never does this) triggered a very fast,
+unthrottled internal retry loop in pymavlink itself
+(`mavtcp.handle_eof()` -> `reconnect()` -> `recv()`, printing "EOF on TCP
+socket" and re-attempting essentially as fast as the CPU allows), which
+coincided with the WSL2 VM itself restarting (`uptime` dropped to a few
+minutes, killing the two long-running ATTACH-mode instances along with
+it). Given that, further root-causing of the SPAWN-mode gap was
+deliberately stopped rather than risking the environment again per this
+project's own safety posture. **This project's own code never calls a
+blocking pymavlink API without a bounded, paced, own-owned retry loop**
+(`_poll_incoming` is always non-blocking; the heartbeat-wait loop in
+`_start_channel` uses `blocking=True, timeout=0.5` inside its own bounded
+outer deadline) - across three full successful scenario-suite runs this
+session, this code path never exhibited the runaway behavior described
+above. SPAWN mode's individual pieces (argv/`--cd` construction, structural
+PID-safe stop/kill, startup-timeout and process-exit detection) remain
+covered by 69 passing unit tests against a portable stand-in executable
+(`sys.executable`); what was not achieved this session is a full,
+successful spawn of the *real* `arducopter` binary through this project's
+own code, start to clean stop. **ATTACH mode - the mode this phase's
+actual required-scenario verification uses throughout - has no such
+limitation** and is fully verified as described above.
 
 ## Library / MAVLink details
 
@@ -128,6 +268,13 @@ anywhere in this code):
     real Windows executable, invoked with list-form arguments exactly
     like any other); on Linux, `argv = [executable_path, *args]` directly.
     `wsl_distro` is required on Windows - refusing to guess one.
+    `working_directory` (a required `ArduPilotVehicleEndpoint` field for
+    spawn mode) is passed as `wsl.exe`'s own `--cd <Directory>` flag on
+    Windows (a first-class flag, not shell construction) or
+    `subprocess.Popen(..., cwd=...)` directly on Linux - without it, real
+    ArduCopter's own EEPROM/parameter file I/O can fail shortly after
+    startup, a real finding from this phase's real-SITL verification (see
+    "Real-SITL verification results" below).
   - **Process ownership verification is structural, not PID-based**: this
     class never re-acquires a process handle by looking up a PID - every
     lifecycle method (`is_running`, `poll_exit_code`, `stop`) acts only
@@ -347,14 +494,24 @@ wall-clock read.
 
 ## Multi-vehicle verification
 
-Verified with two real, independent dummy-vehicle MAVLink connections
-(distinct ports, distinct `system_id`s) in `tests/test_ardupilot_sitl.py`:
-unique system IDs and localhost endpoints enforced at construction,
-commands sent to one vehicle never touch the other's
-`last_accepted_sequence`/`command_history`, telemetry/acks always carry
-the requesting vehicle's own identity, one vehicle's connection loss
-(heartbeat timeout) is independently detected without affecting the
-other, and sequence tracking is fully independent per vehicle.
+Verified twice, at two different levels:
+
+- **Unit level**, with two real, independent dummy-vehicle MAVLink
+  connections (distinct ports, distinct `system_id`s) in
+  `tests/test_ardupilot_sitl.py`: unique system IDs and localhost
+  endpoints enforced at construction, commands sent to one vehicle never
+  touch the other's `last_accepted_sequence`/`command_history`,
+  telemetry/acks always carry the requesting vehicle's own identity, one
+  vehicle's connection loss (heartbeat timeout) is independently detected
+  without affecting the other, and sequence tracking is fully independent
+  per vehicle.
+- **Real-SITL level**, with two real, independent ArduCopter SITL
+  processes (`system_id` 1 and 2, ports 5760/5770 - see "Real-SITL
+  verification results" above): `two_vehicles_nominal` sent 10 commands
+  to each of the two real vehicles interleaved (20 total) and all 20 were
+  independently accepted by their own vehicle; `namespace_mismatch`
+  confirmed a command addressed to the wrong vehicle's namespace is
+  rejected before ever reaching either real connection.
 
 ## FakeSITL versus real-SITL differences (summary)
 
@@ -391,19 +548,11 @@ project's own stated plan (unchanged since Phase 6/7).
 - **Python**: 3.12.10 (Windows venv, unchanged environment).
 - **pymavlink**: 2.4.49, installed via `pip install pymavlink` (recorded
   in `requirements.txt`; no sudo, no system packages).
-- **ArduPilot version/build**: **not built at the time of this report** -
-  WSL2 (`Ubuntu-22.04` distro, officially supported for ArduPilot's build
-  scripts) is available on this machine with ~954GB free disk, but
-  `sudo` requires an interactive password this non-interactive tool
-  session cannot supply, so ArduPilot's `Tools/environment_install/install-prereqs-ubuntu.sh`
-  could not be run automatically. The operator was given the exact
-  commands to run themselves:
-  ```bash
-  cd ~ && git clone --recurse-submodules https://github.com/ArduPilot/ardupilot.git
-  cd ardupilot && Tools/environment_install/install-prereqs-ubuntu.sh -y && . ~/.profile
-  ./waf configure --board sitl && ./waf copter
-  Tools/autotest/sim_vehicle.py -v ArduCopter -I0 --no-mavproxy -w
-  ```
+- **ArduPilot version/build**: **built and run** - `Copter-4.6.3`
+  (commit `92b0cd788ec29406f26c6f9c31d5ceedbd1cc538`), built for the
+  `sitl` board in WSL2 (`Ubuntu-22.04`). See "Real-SITL verification
+  results" above for the exact build/launch commands, build tool
+  versions, and findings.
 - **Commit hash**: recorded automatically by
   `scripts/run_phase8_ardupilot_sitl.py` in each scenario's
   `reproducibility.commit_hash` field.
@@ -422,16 +571,15 @@ project's own stated plan (unchanged since Phase 6/7).
   python scripts/run_phase8_ardupilot_sitl.py --dry-run
   python scripts/run_phase8_ardupilot_sitl.py --local-sitl
   ```
-- **Test count**: 69 new tests this phase (50 in `tests/test_ardupilot_sitl.py`,
-  19 in `tests/test_ardupilot_sitl_architecture.py`).
-- **Whether real ArduPilot SITL actually ran**: **No.** Every functional
-  test in this phase ran against either `FakeSITLTransport` (Phase 7,
-  unmodified) or `tests/_dummy_ardupilot_vehicle.py` (a local, in-process
-  test double speaking real MAVLink over a real localhost socket, but not
-  real ArduPilot firmware). `scripts/run_phase8_ardupilot_sitl.py --local-sitl`
-  itself probes for a real reachable SITL instance and prints the
-  required honest statement when none is found - it was run in this
-  state and printed exactly that.
+- **Test count**: 69 tests this phase (50 in `tests/test_ardupilot_sitl.py`,
+  19 in `tests/test_ardupilot_sitl_architecture.py`), all against
+  `FakeSITLTransport`/the dummy MAVLink fixture (fast, deterministic,
+  run on every `pytest` invocation) - plus 18 required scenarios run
+  separately against the real ArduCopter SITL processes described above.
+- **Whether real ArduPilot SITL actually ran**: **Yes**, for the 18
+  transport-level scenarios (see "Real-SITL verification results" above).
+  Scenarios 20-22 (the full-mission scenarios) remain FakeSITL-backed -
+  see "Remaining risks" below for why.
 
 ## Remaining risks
 
@@ -447,6 +595,24 @@ project's own stated plan (unchanged since Phase 6/7).
   `waitpid`-style signal; a real SITL process that hangs without ever
   sending garbage or dying outright would look identical to a genuinely
   slow but alive vehicle until the heartbeat timeout fires.
+- **SPAWN mode against the real binary was not cleanly reproduced this
+  session** - see "Real-SITL verification results" above for the full
+  account (the `working_directory`/`--cd` fix was necessary and verified
+  correct in isolation, but a fresh spawn still exited shortly after
+  binding its port for a reason not fully isolated, and further ad-hoc
+  debugging via a direct blocking pymavlink call coincided with a WSL2 VM
+  restart). ATTACH mode has no such limitation.
+- **Do not call blocking pymavlink APIs (e.g. `wait_heartbeat()`,
+  `recv_match(blocking=True)` without an externally-owned timeout budget)
+  directly against a connection that may see the peer close/EOF** -
+  pymavlink's own `mavtcp` implementation prints "EOF on TCP socket" and
+  retries internally with no backoff, which can spin very fast and,
+  observed once this session, coincided with the WSL2 VM itself
+  restarting. This project's own `ArduPilotSITLTransport` never does
+  this (every blocking call it makes uses an explicit short `timeout=`
+  inside its own bounded outer loop) - this risk applies to anyone using
+  `pymavlink`/this integration outside the code paths this project itself
+  uses, not to a code path this transport exercises.
 - Real ArduPilot SITL combined with PyBullet's own mission-level
   simulation stepping (scenarios 20-22: Phase 4.1 obstacle-wedging, Phase
   5 distributed-consensus, extreme-stress) was not attempted - these

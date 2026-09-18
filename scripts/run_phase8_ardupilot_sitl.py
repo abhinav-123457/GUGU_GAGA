@@ -178,9 +178,31 @@ def _run_transport_scenario(name, n_vehicles, body, real_sitl_available):
         endpoints = _endpoints(n_vehicles)
         result.executable = "real ArduPilot SITL (operator-started, attach mode)"
         result.command_line = f"attach: {list(endpoints[v].connection_string for v in vids)}"
-        transport = ArduPilotSITLTransport(endpoints, allowed_ports=ALLOWED_PORTS, startup_timeout_s=15.0)
+        # Same generous future_tolerance_s rationale as the FakeSITL branch
+        # below: these scenario bodies send several commands spanning up to
+        # ~1s of simulated time without ever calling set_sim_time() to
+        # advance the transport's own clock - a property of this
+        # lightweight smoke-scenario harness, not of ArduPilotSITLTransport's
+        # own (unmodified) default (0.5s, appropriate for real operation).
+        transport = ArduPilotSITLTransport(endpoints, allowed_ports=ALLOWED_PORTS, startup_timeout_s=15.0,
+                                            future_tolerance_s=5.0)
         transport.start()
         adapters = {v: build_ardupilot_sitl_adapter(v, transport) for v in vids}
+        # Real ArduCopter's first telemetry burst (LOCAL_POSITION_NED etc.,
+        # requested via MAV_CMD_SET_MESSAGE_INTERVAL in _start_channel) is
+        # not instantaneous - unlike the deterministic FakeSITL/dummy-vehicle
+        # fixtures, there is a real, small, non-zero real-world delay. Wait
+        # for it here so the scenario body below does not race ahead of it
+        # and see a spurious "stale_telemetry" rejection on its very first
+        # command - a genuine real-hardware/software timing property, not a
+        # transport bug (confirmed by unit tests against the dummy fixture,
+        # where no such warm-up is needed).
+        warm_deadline = time.monotonic() + 5.0
+        for v in vids:
+            transport.receive_telemetry(v)  # polls the connection, populating channel state
+            while transport._channel(v).last_state_update_sim_s is None and time.monotonic() < warm_deadline:
+                time.sleep(0.05)
+                transport.receive_telemetry(v)
     else:
         result.executable = "FakeSITLTransport (real ArduPilot SITL unavailable)"
         result.command_line = "n/a - in-memory"

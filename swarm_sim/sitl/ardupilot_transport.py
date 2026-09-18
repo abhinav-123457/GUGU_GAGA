@@ -177,6 +177,18 @@ class ArduPilotVehicleEndpoint:
     executable_path: Optional[str] = None
     extra_args: Tuple[str, ...] = ()
     wsl_distro: Optional[str] = None   # required when spawning from a Windows host - see _SITLProcessHandle
+    # The Linux-side directory to run the SITL binary from (e.g. an
+    # ArduPilot checkout root such as "/home/user/ardupilot") - real
+    # ArduCopter SITL opens its EEPROM/parameter files relative to its
+    # working directory and can exit shortly after startup if this is
+    # wrong or unwritable. Required for spawn mode: without it, on
+    # Windows, wsl.exe defaults the Linux-side cwd to a DrvFs translation
+    # of the *Windows* caller's own working directory (e.g.
+    # "/mnt/c/Users/..."), not any Linux path related to the SITL
+    # checkout - confirmed during Phase 8 real-SITL verification, where
+    # this caused ArduCopter to bind its MAVLink port successfully and
+    # then exit(1) immediately after. See docs/PHASE8_ARDUPILOT_SITL.md.
+    working_directory: Optional[str] = None
 
     def __post_init__(self):
         proto, host, port = parse_connection_string(self.connection_string)
@@ -245,6 +257,9 @@ def dry_run_validate(endpoints: Dict[str, ArduPilotVehicleEndpoint],
         if endpoint.executable_path is not None:
             if platform.system() == "Windows" and not endpoint.wsl_distro:
                 problems.append(f"{vehicle_id}: spawning a local SITL binary from Windows requires wsl_distro to be set")
+            if not endpoint.working_directory:
+                problems.append(f"{vehicle_id}: spawn mode requires working_directory to be set "
+                                 f"(the SITL binary's own checkout directory - see ArduPilotVehicleEndpoint docstring)")
     if not PYMAVLINK_AVAILABLE:
         problems.append("pymavlink is not importable - real ArduPilot SITL transport cannot run (see requirements.txt)")
     return DryRunReport(ok=(len(problems) == 0), vehicle_ids=tuple(endpoints.keys()),
@@ -261,10 +276,12 @@ class _SITLProcessHandle:
     process by bare PID at all). `shell=False` always; args are a list,
     never a formatted string - see module docstring."""
 
-    def __init__(self, executable_path: str, args: Sequence[str] = (), wsl_distro: Optional[str] = None):
+    def __init__(self, executable_path: str, args: Sequence[str] = (), wsl_distro: Optional[str] = None,
+                 working_directory: Optional[str] = None):
         self.executable_path = executable_path
         self.args = tuple(args)
         self.wsl_distro = wsl_distro
+        self.working_directory = working_directory
         self._popen: Optional[subprocess.Popen] = None
         self.pid: Optional[int] = None
         self.launched_argv: Optional[Tuple[str, ...]] = None
@@ -273,18 +290,29 @@ class _SITLProcessHandle:
         self.stderr_text: str = ""
 
     def start(self) -> None:
+        popen_cwd = None
         if platform.system() == "Windows":
             if not self.wsl_distro:
                 raise ArduPilotTransportError(
                     "spawning a local SITL binary from a Windows host requires wsl_distro "
                     "(e.g. 'Ubuntu-22.04') - Windows cannot directly execute a Linux ELF binary"
                 )
-            argv = ("wsl.exe", "-d", self.wsl_distro, "--", self.executable_path, *self.args)
+            # Without --cd, wsl.exe defaults the Linux-side working
+            # directory to a DrvFs translation of THIS (Windows) process's
+            # own cwd (e.g. "/mnt/c/Users/..."), not any path related to
+            # the SITL checkout - confirmed during Phase 8 real-SITL
+            # verification to make real ArduCopter bind its MAVLink port
+            # and then exit(1) shortly after, trying to open its
+            # EEPROM/parameter files. --cd is a first-class wsl.exe flag
+            # (not shell construction) taking a literal Linux path.
+            cd_args = ("--cd", self.working_directory) if self.working_directory else ()
+            argv = ("wsl.exe", "-d", self.wsl_distro, *cd_args, "--", self.executable_path, *self.args)
         else:
             argv = (self.executable_path, *self.args)
+            popen_cwd = self.working_directory
         self.launched_argv = argv
         self._popen = subprocess.Popen(list(argv), shell=False, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, text=True)
+                                        stderr=subprocess.PIPE, text=True, cwd=popen_cwd)
         self.pid = self._popen.pid
 
     def poll_exit_code(self) -> Optional[int]:
@@ -295,6 +323,20 @@ class _SITLProcessHandle:
 
     def is_running(self) -> bool:
         return self._popen is not None and self.poll_exit_code() is None
+
+    def drain_output_after_exit(self) -> None:
+        """Only safe to call once `is_running()` has already confirmed the
+        process has exited - reading these pipes while the process is still
+        alive can block indefinitely waiting for EOF. Populates
+        stdout_text/stderr_text so a caller reporting an unexpected exit
+        (e.g. during startup) can include the real reason instead of an
+        always-empty string."""
+        if self._popen is None or self._popen.poll() is None:
+            return
+        if self._popen.stdout:
+            self.stdout_text = self._popen.stdout.read()
+        if self._popen.stderr:
+            self.stderr_text = self._popen.stderr.read()
 
     def stop(self, graceful_timeout_s: float = 5.0) -> None:
         if self._popen is None:
@@ -307,10 +349,7 @@ class _SITLProcessHandle:
                 self._popen.kill()
                 self._popen.wait(timeout=graceful_timeout_s)
         self.exit_code = self._popen.returncode
-        if self._popen.stdout:
-            self.stdout_text = self._popen.stdout.read()
-        if self._popen.stderr:
-            self.stderr_text = self._popen.stderr.read()
+        self.drain_output_after_exit()
 
 
 @dataclasses.dataclass
@@ -446,7 +485,8 @@ class ArduPilotSITLTransport:
     def _start_channel(self, channel: _VehicleMavlinkChannel) -> None:
         endpoint = channel.endpoint
         if endpoint.executable_path is not None:
-            channel.process = _SITLProcessHandle(endpoint.executable_path, endpoint.extra_args, endpoint.wsl_distro)
+            channel.process = _SITLProcessHandle(endpoint.executable_path, endpoint.extra_args, endpoint.wsl_distro,
+                                                  endpoint.working_directory)
             channel.process.start()
 
         deadline = time.monotonic() + self.startup_timeout_s
@@ -461,6 +501,7 @@ class ArduPilotSITLTransport:
         # attempt.
         while channel.connection is None:
             if channel.process is not None and not channel.process.is_running():
+                channel.process.drain_output_after_exit()
                 raise ArduPilotTransportError(
                     f"{channel.vehicle_id}: SITL process exited during startup "
                     f"(exit code {channel.process.exit_code}); stderr: {channel.process.stderr_text[-500:]}"
@@ -485,6 +526,7 @@ class ArduPilotSITLTransport:
 
         while time.monotonic() < deadline:
             if channel.process is not None and not channel.process.is_running():
+                channel.process.drain_output_after_exit()
                 raise ArduPilotTransportError(
                     f"{channel.vehicle_id}: SITL process exited during startup "
                     f"(exit code {channel.process.exit_code}); stderr: {channel.process.stderr_text[-500:]}"
@@ -496,6 +538,7 @@ class ArduPilotSITLTransport:
                 channel.connected = True
                 channel.heartbeat_ok = True
                 channel.last_heartbeat_monotonic_s = time.monotonic()
+                self._request_telemetry_streams(channel)
                 return
             # Heartbeat from an identity we did not configure for this
             # vehicle - ignored, never accepted as this vehicle's own.
@@ -504,6 +547,32 @@ class ArduPilotSITLTransport:
             f"from system_id={endpoint.system_id}, component_id={endpoint.component_id} "
             f"on {endpoint.connection_string}"
         )
+
+    # Real ArduPilot (unlike this project's dummy test vehicle, which
+    # always streams telemetry unsolicited) does not proactively send
+    # LOCAL_POSITION_NED/ATTITUDE/SYS_STATUS/EKF_STATUS_REPORT to a freshly
+    # connected MAVLink endpoint - confirmed against a real local
+    # ArduCopter SITL instance (Phase 8 real-SITL verification): these
+    # messages simply never arrive without this explicit per-message
+    # opt-in. This is a real, documented ArduPilot behavior difference
+    # from FakeSITLTransport, not a workaround - see
+    # docs/PHASE8_ARDUPILOT_SITL.md.
+    _REQUIRED_TELEMETRY_MESSAGE_IDS = (
+        mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED if PYMAVLINK_AVAILABLE else None,
+        mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE if PYMAVLINK_AVAILABLE else None,
+        mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS if PYMAVLINK_AVAILABLE else None,
+        mavutil.mavlink.MAVLINK_MSG_ID_EKF_STATUS_REPORT if PYMAVLINK_AVAILABLE else None,
+    )
+
+    def _request_telemetry_streams(self, channel: "_VehicleMavlinkChannel", rate_hz: float = 10.0) -> None:
+        endpoint = channel.endpoint
+        interval_us = 1_000_000.0 / rate_hz
+        for message_id in self._REQUIRED_TELEMETRY_MESSAGE_IDS:
+            channel.connection.mav.command_long_send(
+                endpoint.system_id, endpoint.component_id,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                message_id, interval_us, 0, 0, 0, 0, 0,
+            )
 
     def stop(self) -> TransportResult:
         for channel in self._channels.values():
