@@ -117,9 +117,37 @@ def vehicle_id_from_namespace(namespace: str) -> str:
     return namespace[len(_NAMESPACE_PREFIX):]
 
 
+_HELP_EPILOG = """\
+Example (PowerShell - single line, simplest, always works):
+  python scripts/run_phase9_single_vehicle_visual.py --attach --connection tcp:127.0.0.1:5760 --system-id 1 --component-id 1 --namespace sitl/drone0 --duration 120
+
+Example (PowerShell - multiline, use a backtick ` - NOT a trailing backslash):
+  python scripts/run_phase9_single_vehicle_visual.py `
+    --attach `
+    --connection tcp:127.0.0.1:5760 `
+    --duration 120
+
+Example (WSL / Linux Bash - multiline, use a trailing backslash \\):
+  python scripts/run_phase9_single_vehicle_visual.py \\
+    --attach \\
+    --connection tcp:127.0.0.1:5760 \\
+    --duration 120
+
+Example (Windows CMD - multiline, use a caret ^):
+  python scripts/run_phase9_single_vehicle_visual.py ^
+    --attach ^
+    --connection tcp:127.0.0.1:5760 ^
+    --duration 120
+
+See docs/PHASE9_SINGLE_VEHICLE_VISUAL.md's "Command syntax by platform"
+section for the full reference (WSL/Windows setup, execution-policy notes).
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Phase 9: one-vehicle real ArduPilot SITL visual integration (ATTACH mode only).",
+        epilog=_HELP_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--connection", default="tcp:127.0.0.1:5760",
                          help="pymavlink connection string to an ALREADY RUNNING ArduCopter SITL instance - "

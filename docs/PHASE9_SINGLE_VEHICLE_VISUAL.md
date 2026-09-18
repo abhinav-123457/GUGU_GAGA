@@ -29,6 +29,95 @@ own ArduCopter process) is a separate, still-open limitation - see Phase
 - This phase controls **exactly one** drone. It does not run, and makes no
   claims about, the full six-drone search-and-rescue swarm.
 
+## Command syntax by platform (read this first if you got a PowerShell error)
+
+> **Do not paste Bash's trailing `\` into PowerShell.** PowerShell does not
+> treat `\` as a line-continuation character - it errors. Likewise, never
+> copy an accidental `-->` prompt-arrow prefix from a terminal recording
+> into a real command; it is not part of the command.
+>
+> - **PowerShell**: put the whole command on one line, or continue lines
+>   with a backtick (`` ` ``).
+> - **Windows CMD**: continue lines with a caret (`^`).
+> - **WSL / Linux Bash**: continue lines with a backslash (`\`).
+
+### Which terminal am I using?
+
+| Terminal | Line continuation |
+|---|---|
+| Windows PowerShell (`powershell.exe`, `pwsh`) | backtick `` ` `` (or just use one line) |
+| Windows CMD (`cmd.exe`) | caret `^` |
+| WSL / Linux Bash | backslash `\` |
+
+### PowerShell - single line (simplest, always works)
+
+```powershell
+python scripts/run_phase9_single_vehicle_visual.py --attach --connection tcp:127.0.0.1:5760 --system-id 1 --component-id 1 --namespace sitl/drone0 --duration 120
+```
+
+### PowerShell - multiline (backtick continuation)
+
+```powershell
+python scripts/run_phase9_single_vehicle_visual.py `
+  --attach `
+  --connection tcp:127.0.0.1:5760 `
+  --system-id 1 `
+  --component-id 1 `
+  --namespace sitl/drone0 `
+  --duration 120
+```
+
+### WSL / Linux Bash - multiline (backslash continuation)
+
+```bash
+python scripts/run_phase9_single_vehicle_visual.py \
+  --attach \
+  --connection tcp:127.0.0.1:5760 \
+  --system-id 1 \
+  --component-id 1 \
+  --namespace sitl/drone0 \
+  --duration 120
+```
+
+### Windows CMD - multiline (caret continuation)
+
+```cmd
+python scripts/run_phase9_single_vehicle_visual.py ^
+  --attach ^
+  --connection tcp:127.0.0.1:5760 ^
+  --system-id 1 ^
+  --component-id 1 ^
+  --namespace sitl/drone0 ^
+  --duration 120
+```
+
+### Windows setup (PowerShell)
+
+```powershell
+cd C:\path\to\GUGU_GAGA
+.\.venv\Scripts\Activate.ps1
+```
+
+If PowerShell's execution policy blocks activation (an error like
+`... cannot be loaded because running scripts is disabled on this
+system`), use a **session-only** bypass - this does not change your
+machine-wide execution policy:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+### WSL / Linux setup
+
+```bash
+cd /path/to/GUGU_GAGA
+source .venv/bin/activate
+```
+
+Every other command example in this document (Steps 2/3/5/6 below) is
+written in Bash/WSL syntax - use the PowerShell/CMD equivalents above if
+you are on Windows outside WSL.
+
 ## Architecture
 
 ```
