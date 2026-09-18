@@ -38,6 +38,7 @@ from .autopilot import AdapterCommand as AutopilotAdapterCommand
 from .autopilot import ConnectionState as AutopilotConnectionState
 from .autopilot import MockAdapter
 from .autopilot import VehicleTelemetry as AutopilotVehicleTelemetry
+from .autopilot.ardupilot_sitl import build_ardupilot_sitl_adapter
 from .autopilot.sitl import SITLAdapter
 from .consensus import ConsensusBoard
 from .contracts import CommandType, Frame, GeofenceSpec, HealthState, SensorObservation, VehicleState
@@ -51,6 +52,7 @@ from .safety_supervisor import (
 from .seeding import SeedManager
 from .sensors import NeighborSensorModel, ObstacleRangeSensor, VictimSensorModel
 from .sitl import FakeSITLTransport
+from .sitl.ardupilot_transport import ArduPilotSITLTransport, ArduPilotVehicleEndpoint, parse_connection_string
 from .speed_control import SpeedController
 from .telemetry import TelemetryHub
 
@@ -264,6 +266,52 @@ class FloodSearchMission:
                     namespace=self.sitl_transport.registry.namespace_of(self._drone_ids[i]),
                     transport=self.sitl_transport, operating_frame=Frame.LOCAL_ENU,
                 )
+                for i in range(config.num_drones)
+            }
+            for adapter in self.autopilot_adapters.values():
+                adapter.connect()
+        elif config.autopilot_path == "ardupilot_sitl":
+            # Phase 8: real local ArduPilot SITL - see
+            # docs/PHASE8_ARDUPILOT_SITL.md. Never the default; requires
+            # every one of these fields to be explicitly filled in by the
+            # caller (see config.py's own comment) - a bare
+            # `autopilot_path="ardupilot_sitl"` with no endpoint
+            # configuration fails loudly here, never silently falls back
+            # to fake_sitl/mock_adapter.
+            if not config.ardupilot_sitl_connection_strings or not config.ardupilot_sitl_system_ids:
+                raise ValueError(
+                    "autopilot_path='ardupilot_sitl' requires ardupilot_sitl_connection_strings "
+                    "and ardupilot_sitl_system_ids to be explicitly set (one entry per drone)"
+                )
+            if (len(config.ardupilot_sitl_connection_strings) != config.num_drones
+                    or len(config.ardupilot_sitl_system_ids) != config.num_drones):
+                raise ValueError(
+                    "ardupilot_sitl_connection_strings/ardupilot_sitl_system_ids must have exactly "
+                    f"num_drones={config.num_drones} entries"
+                )
+            allowed_ports = config.ardupilot_sitl_allowed_ports
+            if not allowed_ports:
+                allowed_ports = tuple(
+                    parse_connection_string(cs)[2] for cs in config.ardupilot_sitl_connection_strings
+                )
+            endpoints = {
+                self._drone_ids[i]: ArduPilotVehicleEndpoint(
+                    vehicle_id=self._drone_ids[i],
+                    connection_string=config.ardupilot_sitl_connection_strings[i],
+                    system_id=config.ardupilot_sitl_system_ids[i],
+                    component_id=config.ardupilot_sitl_component_id,
+                )
+                for i in range(config.num_drones)
+            }
+            self.sitl_transport = ArduPilotSITLTransport(
+                endpoints, allowed_ports=frozenset(allowed_ports), operating_frame=Frame.LOCAL_ENU,
+                startup_timeout_s=config.ardupilot_sitl_startup_timeout_s,
+                heartbeat_timeout_s=config.ardupilot_sitl_heartbeat_timeout_s,
+                ack_timeout_s=config.ardupilot_sitl_ack_timeout_s,
+            )
+            self.sitl_transport.start()   # raises ArduPilotTransportError on failure - never a silent FakeSITL fallback
+            self.autopilot_adapters = {
+                i: build_ardupilot_sitl_adapter(self._drone_ids[i], self.sitl_transport, operating_frame=Frame.LOCAL_ENU)
                 for i in range(config.num_drones)
             }
             for adapter in self.autopilot_adapters.values():

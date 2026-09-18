@@ -5,6 +5,14 @@ pybullet
 gymnasium
 transforms3d
 
+# Phase 8 (swarm_sim/sitl/ardupilot_transport.py) - real local ArduPilot
+# SITL transport over MAVLink. Only imported by that one module and
+# swarm_sim/autopilot/ardupilot_sitl.py's real-transport factory function;
+# every other module (FakeSITL, MockAdapter, mission.py, distributed
+# consensus, ...) has zero dependency on it - see
+# docs/PHASE8_ARDUPILOT_SITL.md.
+pymavlink==2.4.49
+
 # gym-pybullet-drones is vendored in third_party/ (no PyPI release) and
 # installed separately, without its heavy RL-training extras:
 #   pip install -e third_party/gym-pybullet-drones --no-deps

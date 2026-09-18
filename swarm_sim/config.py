@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -169,8 +170,13 @@ class MissionConfig:
     # connection-state validated) before reaching PyBullet. Phase 7 adds
     # "fake_sitl" (swarm_sim/sitl/): the same validated command additionally
     # passes through a SITLTransport (FakeSITLTransport) one layer below the
-    # adapter - see docs/PHASE7_SITL_INTEGRATION.md.
-    autopilot_path: str = "mock_adapter"     # "mock_adapter" | "fake_sitl" | "direct"
+    # adapter - see docs/PHASE7_SITL_INTEGRATION.md. Phase 8 adds
+    # "ardupilot_sitl": the SAME SITLTransport boundary, now backed by a
+    # REAL local ArduPilot SITL process over MAVLink instead of the
+    # deterministic fake - see docs/PHASE8_ARDUPILOT_SITL.md. The default
+    # is deliberately never "ardupilot_sitl" - a caller must opt in
+    # explicitly, every time.
+    autopilot_path: str = "mock_adapter"     # "mock_adapter" | "fake_sitl" | "ardupilot_sitl" | "direct"
     autopilot_command_latency_s: float = 0.0
     autopilot_telemetry_latency_s: float = 0.0
     autopilot_command_packet_loss_prob: float = 0.0
@@ -185,6 +191,23 @@ class MissionConfig:
     # docs/PHASE7_SITL_INTEGRATION.md.
     sitl_ack_timeout_s: float = 5.0
     sitl_future_tolerance_s: float = 0.05
+
+    # Phase 8: real local ArduPilot SITL transport (swarm_sim/sitl/ardupilot_transport.py) -
+    # only used when autopilot_path == "ardupilot_sitl"; None-valued fields
+    # here are exactly why "ardupilot_sitl" cannot be selected by accident -
+    # FloodSearchMission.__init__ requires these to be explicitly filled in
+    # (one entry per drone, in drone-index order) before it will construct
+    # an ArduPilotSITLTransport - see docs/PHASE8_ARDUPILOT_SITL.md.
+    # Endpoints are localhost-only and rejected otherwise regardless of
+    # what is configured here (see ArduPilotSITLTransport's own
+    # constructor-time validation).
+    ardupilot_sitl_connection_strings: Optional[Tuple[str, ...]] = None    # e.g. ("tcp:127.0.0.1:5760", "tcp:127.0.0.1:5770")
+    ardupilot_sitl_system_ids: Optional[Tuple[int, ...]] = None            # e.g. (1, 2) - must be unique
+    ardupilot_sitl_component_id: int = 1                                   # MAV_COMP_ID_AUTOPILOT1 for every vehicle
+    ardupilot_sitl_allowed_ports: Optional[Tuple[int, ...]] = None         # explicit allow-list checked against every connection string's port
+    ardupilot_sitl_startup_timeout_s: float = 30.0
+    ardupilot_sitl_heartbeat_timeout_s: float = 5.0
+    ardupilot_sitl_ack_timeout_s: float = 3.0
 
     # Simulation
     duration_sec: float = 90.0
