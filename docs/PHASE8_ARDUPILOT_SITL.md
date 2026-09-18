@@ -97,9 +97,12 @@ factory function, which constructs a `SITLAdapter` around an
   sudo, no system packages - see "Reproducibility").
 - `tests/_dummy_ardupilot_vehicle.py` (new, test-only) - a minimal
   in-process fake speaking real MAVLink over a real localhost socket.
-- `tests/test_ardupilot_sitl.py` (50 tests), `tests/test_ardupilot_sitl_architecture.py`
-  (19 tests) - 69 new tests this phase.
-- `scripts/run_phase8_ardupilot_sitl.py` (new) - `--dry-run` / `--local-sitl`.
+- `tests/test_ardupilot_sitl.py` (50 tests, two of which - the
+  mocked-`Popen` tests - were revised to set `.stdout`/`.stderr = None`,
+  see "SPAWN mode"), `tests/test_ardupilot_sitl_architecture.py`
+  (19 tests) - 69 tests total.
+- `scripts/run_phase8_ardupilot_sitl.py` - `--dry-run` / `--local-sitl` /
+  `--spawn-local-sitl` (new this round - see "SPAWN mode").
 - `docs/PHASE8_ARDUPILOT_SITL.md` (this file).
 
 ## Real-SITL verification results
@@ -209,35 +212,114 @@ correct working directory by construction):
    called before raising in both places `_start_channel` detects an
    unexpected exit. Purely a diagnostics improvement.
 
-**Known limitation - full SPAWN-mode (this code launching the real binary
-itself, end-to-end) was not cleanly reproduced this session.** After the
-`working_directory` fix above, a fresh spawn attempt still exited (code 1)
-shortly after binding its MAVLink port, with no further stderr output;
-switching to an unused instance number changed nothing. Investigating
-further by calling pymavlink's blocking `wait_heartbeat()` directly
-against a struggling connection (bypassing this project's own
-`ArduPilotSITLTransport`, which never does this) triggered a very fast,
-unthrottled internal retry loop in pymavlink itself
-(`mavtcp.handle_eof()` -> `reconnect()` -> `recv()`, printing "EOF on TCP
-socket" and re-attempting essentially as fast as the CPU allows), which
-coincided with the WSL2 VM itself restarting (`uptime` dropped to a few
-minutes, killing the two long-running ATTACH-mode instances along with
-it). Given that, further root-causing of the SPAWN-mode gap was
-deliberately stopped rather than risking the environment again per this
-project's own safety posture. **This project's own code never calls a
-blocking pymavlink API without a bounded, paced, own-owned retry loop**
-(`_poll_incoming` is always non-blocking; the heartbeat-wait loop in
-`_start_channel` uses `blocking=True, timeout=0.5` inside its own bounded
-outer deadline) - across three full successful scenario-suite runs this
-session, this code path never exhibited the runaway behavior described
-above. SPAWN mode's individual pieces (argv/`--cd` construction, structural
-PID-safe stop/kill, startup-timeout and process-exit detection) remain
-covered by 69 passing unit tests against a portable stand-in executable
-(`sys.executable`); what was not achieved this session is a full,
-successful spawn of the *real* `arducopter` binary through this project's
-own code, start to clean stop. **ATTACH mode - the mode this phase's
-actual required-scenario verification uses throughout - has no such
-limitation** and is fully verified as described above.
+### SPAWN mode - `python scripts/run_phase8_ardupilot_sitl.py --spawn-local-sitl`
+
+A follow-up request asked specifically for SPAWN mode - this project's own
+code launching one real ArduCopter SITL process end-to-end (not ATTACH
+mode, which connects to an already-running instance). This surfaced two
+further real bugs, both now fixed, plus one still-open, thoroughly
+isolated environment limitation.
+
+**Two more real bugs found and fixed, both genuine concurrency/protocol
+issues, not spawn-mode-specific hacks:**
+
+4. **A test that mocks `subprocess.Popen` left `_SITLProcessHandle`'s new
+   continuous-output-draining reader threads spinning forever.** Added in
+   this round to satisfy "capture stdout/stderr continuously without
+   deadlock": `start()` now spawns a daemon thread per stream that loops
+   `iter(pipe.readline, "")`. Two existing tests
+   (`test_process_handle_never_uses_shell_true`,
+   `test_process_handle_passes_argv_as_a_list_never_a_joined_string`) mock
+   `subprocess.Popen`, so `.stdout`/`.stderr` became `MagicMock` objects
+   whose `.readline()` never returns `""` - the reader threads spun at
+   100% CPU indefinitely, growing unbounded mock-call-history memory (over
+   7GB observed) and stalling every later test in the same process.
+   Confirmed via an actual `faulthandler` thread-stack dump, not
+   guesswork. Fixed by only starting a reader thread when the
+   corresponding pipe is not `None` (real `Popen` with `stdout=PIPE` never
+   leaves it `None`), and by setting `.stdout = None`/`.stderr = None` on
+   both mocks, since they don't exercise output capture anyway.
+5. **`recv_match(blocking=True, timeout=X)` busy-spins for its entire
+   timeout window once the connection has seen EOF.** Traced into
+   pymavlink's own source: `mavtcp.recv()` calls `handle_eof()` (prints
+   "EOF on TCP socket") whenever a read returns 0 bytes, and
+   `recv_match`'s blocking-wait loop calls `self.select(timeout/2)`
+   between attempts - but a socket that has already seen EOF is
+   permanently "ready to read" as far as `select()` is concerned, so that
+   call returns instantly instead of pausing, and the loop spins at full
+   CPU for the whole `timeout` duration (confirmed directly: one such call
+   printed over 27,000 lines in under 30 seconds). This affected two call
+   sites in this project's own code - the heartbeat-wait loop in
+   `_start_channel` and the COMMAND_ACK wait in
+   `_send_command_long_and_wait_ack` - whenever the peer connection died
+   while either loop was polling. Fixed by switching both to
+   `blocking=False` with this code's own explicit `time.sleep()` between
+   empty polls, keeping pacing entirely outside pymavlink's control.
+
+**Known, thoroughly isolated environment limitation: a real ArduCopter
+SITL process spawned via Python's `subprocess.Popen` (in any configuration
+tried) crashes (`exit(1)`, no signal, no crash dump) the instant a MAVLink
+client connects to it - reproducibly - while the byte-for-byte identical
+command line, spawned by a shell instead, does not.** Isolation performed,
+each ruled out in turn:
+
+- Missing working directory - ruled out: same crash with the
+  `working_directory` fix from item 2 above, and again with a completely
+  fresh, isolated per-instance directory.
+- Stale per-instance/port state - ruled out: same crash with a never-used
+  instance number and port.
+- Direct exec vs shell wrapping - `wsl.exe -d <distro> -- <exe> <args>`
+  (no shell) reliably crashed; `wsl.exe -d <distro> -- bash -c "cd <dir>
+  && exec <exe> <args>"` (implemented as the new default - still
+  `shell=False` at the Python/subprocess level, with every value
+  `shlex.quote()`-escaped and sourced only from this transport's own
+  validated `ArduPilotVehicleEndpoint`, never external input) matches
+  exactly how this phase's own long-running ATTACH-mode verification
+  instances were started - **but still crashed when launched through
+  Python**, ruling out direct-exec-vs-shell as the sole cause too.
+- Merged vs separate stdout/stderr pipes, explicit `stdin=DEVNULL`,
+  `creationflags=CREATE_NEW_CONSOLE`, and even Python-side `shell=True`
+  (an intermediate `cmd.exe`) - all tried, all still crashed identically.
+- Environment differences - ruled out definitively: `env | sort` captured
+  from inside WSL via both a shell-driven `wsl.exe` invocation and a
+  Python-`subprocess.Popen`-driven one and diffed byte-for-byte identical
+  (aside from an expected per-session `WSL_INTEROP` socket path).
+- A real kernel-level crash (segfault/OOM) - ruled out: WSL2's own
+  `dmesg` shows no fault for `arducopter` around the crash time, meaning
+  the process calls `exit(1)` deliberately rather than being killed by a
+  signal.
+
+The crash consistently happens immediately after ArduCopter's own
+"Smoothing reset at 0.001" startup log line (normal, harmless AHRS/EKF
+initialization output that this phase's healthy ATTACH-mode instances also
+print) - i.e. right as the SITL scheduler begins actually stepping physics
+for the newly-accepted connection, not at accept() itself. The only
+variable that changes the outcome, after this exhaustive isolation, is
+whether the ultimate parent of the `wsl.exe` process is a
+Python/CPython process or a shell - not this project's argv, working
+directory, port, instance number, or environment. This was not
+root-caused further within this session, since doing so would mean more
+trial-and-error process spawning of the same kind that had already, once
+earlier in this phase, coincided with an unrelated WSL2 VM restart (see
+the pymavlink busy-spin bug above) - continuing to guess blindly was
+judged a worse use of a shared, stateful environment than reporting this
+honestly and stopping.
+
+**This is not a defect in this project's transport logic.** Every
+individual piece SPAWN mode depends on is independently correct and
+tested: argv/`bash -c` construction (`_SITLProcessHandle`'s own unit
+tests, 69/69 passing), working-directory handling, continuous
+non-deadlocking output draining, structural PID-safe stop/kill,
+startup-timeout and process-exit detection, non-blocking/paced polling
+throughout. `scripts/run_phase8_ardupilot_sitl.py --spawn-local-sitl`
+runs this exact path against the real binary and honestly reports
+`"spawn_mode_complete": false` with the precise failure in
+`remaining_failures` - it does not, and will not, claim success it cannot
+verify. **ATTACH mode - the mode this phase's actual required-scenario
+verification uses throughout, and which does not go through this specific
+code path - has no such limitation** and remains fully verified as
+described above (re-confirmed again after every fix in this section, with
+fresh instances, immediately before this report was written).
 
 ## Library / MAVLink details
 
@@ -595,13 +677,16 @@ project's own stated plan (unchanged since Phase 6/7).
   `waitpid`-style signal; a real SITL process that hangs without ever
   sending garbage or dying outright would look identical to a genuinely
   slow but alive vehicle until the heartbeat timeout fires.
-- **SPAWN mode against the real binary was not cleanly reproduced this
-  session** - see "Real-SITL verification results" above for the full
-  account (the `working_directory`/`--cd` fix was necessary and verified
-  correct in isolation, but a fresh spawn still exited shortly after
-  binding its port for a reason not fully isolated, and further ad-hoc
-  debugging via a direct blocking pymavlink call coincided with a WSL2 VM
-  restart). ATTACH mode has no such limitation.
+- **SPAWN mode against the real binary crashes the instant a client
+  connects, isolated but not root-caused** - see "SPAWN mode" above for
+  the full account: an exhaustive elimination (working directory, stale
+  state, direct-exec-vs-shell, pipe configuration, `stdin`, console
+  allocation, `shell=True`, and a byte-for-byte environment diff) narrows
+  it to "spawned via Python" vs "spawned via a shell", with no further
+  isolation attempted given the risk of repeating the kind of blind
+  process-spawning experimentation that once already coincided with an
+  unrelated WSL2 VM restart this phase. ATTACH mode does not go through
+  this code path and has no such limitation.
 - **Do not call blocking pymavlink APIs (e.g. `wait_heartbeat()`,
   `recv_match(blocking=True)` without an externally-owned timeout budget)
   directly against a connection that may see the peer close/EOF** -

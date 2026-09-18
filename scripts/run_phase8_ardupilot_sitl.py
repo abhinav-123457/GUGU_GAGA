@@ -25,6 +25,20 @@ no default that touches a socket):
         is a hard Phase 8 requirement independent of real-SITL
         availability.
 
+    python scripts/run_phase8_ardupilot_sitl.py --spawn-local-sitl
+        SPAWN mode: this project's own code launches ONE real local
+        ArduCopter SITL process itself (not ATTACH mode - see above),
+        waits for its heartbeat, requests and receives telemetry, sends
+        one safe non-arming HOLD command and verifies its acknowledgement,
+        then stops the exact child process it spawned and verifies none
+        remains. Every step is reported independently
+        (`phase8_spawn_local_sitl_result.json`); `spawn_mode_complete` is
+        only true if every step succeeded. Configurable via
+        PHASE8_SPAWN_EXECUTABLE_PATH/PHASE8_SPAWN_WORKING_DIRECTORY/
+        PHASE8_SPAWN_WSL_DISTRO/PHASE8_SPAWN_PORT/PHASE8_SPAWN_SYSID env
+        vars. Uses a distinct port/system_id from --local-sitl's ATTACH-mode
+        defaults so both can run in the same session without colliding.
+
 Scenarios 1-19 are transport-level (no PyBullet) - real ArduPilot SITL
 when --local-sitl succeeds, FakeSITL otherwise (both clearly labeled per
 scenario in the output). Scenarios 20-22 (Phase 4.1 obstacle-wedging,
@@ -64,6 +78,18 @@ DEFAULT_CONNECTION_STRINGS = os.environ.get(
 DEFAULT_SYSTEM_IDS = [int(x) for x in os.environ.get("PHASE8_SITL_SYSTEM_IDS", "1,2").split(",")]
 ALLOWED_PORTS = frozenset(int(cs.split(":")[2]) for cs in DEFAULT_CONNECTION_STRINGS)
 VEHICLE_IDS = ("drone0", "drone1")
+
+# --spawn-local-sitl: a distinct port/system_id from the ATTACH-mode
+# defaults above, so both can be exercised in the same session without
+# colliding. Overridable via env vars for a different real ArduPilot
+# checkout location.
+SPAWN_EXECUTABLE_PATH = os.environ.get(
+    "PHASE8_SPAWN_EXECUTABLE_PATH", "/home/swarmbuild/ardupilot/build/sitl/bin/arducopter")
+SPAWN_WORKING_DIRECTORY = os.environ.get("PHASE8_SPAWN_WORKING_DIRECTORY", "/home/swarmbuild/ardupilot")
+SPAWN_WSL_DISTRO = os.environ.get("PHASE8_SPAWN_WSL_DISTRO", "Ubuntu-22.04")
+SPAWN_PORT = int(os.environ.get("PHASE8_SPAWN_PORT", "5790"))
+SPAWN_SYSID = int(os.environ.get("PHASE8_SPAWN_SYSID", "3"))
+SPAWN_VEHICLE_ID = "drone_spawn"
 
 
 def _endpoints(n=1):
@@ -434,6 +460,142 @@ def scenario_wrong_component_id(real_sitl_available):
     return _run_transport_scenario("wrong_component_id", 1, body, real_sitl_available)
 
 
+def scenario_spawn_local_sitl():
+    """SPAWN mode: this project's own code launches, communicates with,
+    and cleanly shuts down ONE real local ArduCopter SITL process -
+    distinct from every scenario above, which use ATTACH mode (connecting
+    to an already-running, operator/session-started instance). Never
+    starts a second vehicle (one-vehicle-first requirement). Every step
+    is verified and recorded independently in the returned report -
+    `spawn_mode_complete` is only True if every one of them succeeded;
+    a failure at any step is recorded in `remaining_failures` rather than
+    raising, so a partial run still produces a full, honest report."""
+    report = {
+        "scenario": "spawn_local_sitl",
+        "attach_mode_reference": "unaffected by this scenario - see one_vehicle_nominal/"
+                                  "two_vehicles_nominal above for ATTACH-mode results",
+        "executable_path": SPAWN_EXECUTABLE_PATH,
+        "working_directory": SPAWN_WORKING_DIRECTORY,
+        "wsl_distro": SPAWN_WSL_DISTRO,
+        "connection_string": f"tcp:127.0.0.1:{SPAWN_PORT}",
+        "system_id": SPAWN_SYSID,
+        "component_id": 1,
+        "command_line": None,
+        "pid": None,
+        "pid_ownership_verified": False,
+        "heartbeat": {"received": False, "elapsed_s": None},
+        "telemetry": {"received": False, "fields": {}},
+        "command": {"sent": False, "type": None},
+        "acknowledgement": {"received": False, "accepted": None, "reason": None},
+        "shutdown": {"clean": False, "exit_code": None, "no_child_remains": None},
+        "remaining_failures": [],
+        "spawn_mode_complete": False,
+        "reproducibility": _reproducibility_record(),
+    }
+
+    if not PYMAVLINK_AVAILABLE:
+        report["remaining_failures"].append("pymavlink not importable - cannot attempt spawn mode")
+        return report
+
+    endpoint = ArduPilotVehicleEndpoint(
+        vehicle_id=SPAWN_VEHICLE_ID, connection_string=f"tcp:127.0.0.1:{SPAWN_PORT}",
+        system_id=SPAWN_SYSID, component_id=1,
+        executable_path=SPAWN_EXECUTABLE_PATH,
+        extra_args=("--model", "quad", "--speedup", "1", "-I3",
+                    "--home", "-35.363261,149.165230,584,353", "--sysid", str(SPAWN_SYSID)),
+        wsl_distro=SPAWN_WSL_DISTRO,
+        working_directory=SPAWN_WORKING_DIRECTORY,
+    )
+    # startup_timeout_s=30.0 is a bounded wait, not a tight loop -
+    # _start_channel's own connection-retry pacing (0.2s between attempts,
+    # plus a 1.5s post-spawn grace period) is unchanged, real-SITL-derived
+    # behavior, exercised here against a process THIS SCRIPT spawns rather
+    # than one already running.
+    transport = ArduPilotSITLTransport(
+        {SPAWN_VEHICLE_ID: endpoint}, allowed_ports=frozenset({SPAWN_PORT}), startup_timeout_s=30.0,
+    )
+
+    t0 = time.monotonic()
+    try:
+        transport.start()
+    except ArduPilotTransportError as e:
+        report["remaining_failures"].append(f"start() failed: {e}")
+        channel = transport._channel(SPAWN_VEHICLE_ID)
+        if channel.process is not None:
+            report["pid"] = channel.process.pid
+            report["command_line"] = list(channel.process.launched_argv) if channel.process.launched_argv else None
+            report["stderr_tail"] = channel.process.stderr_text[-1000:]
+            channel.process.stop()  # never leave an orphan behind, even on a failed start
+            report["shutdown"]["no_child_remains"] = not channel.process.is_running()
+        return report
+
+    channel = transport._channel(SPAWN_VEHICLE_ID)
+    report["pid"] = channel.process.pid
+    report["command_line"] = list(channel.process.launched_argv)
+    # Ownership is structural, not a PID re-lookup (see _SITLProcessHandle's
+    # own docstring) - is_running()/stop() below act only on the exact
+    # Popen object start() created, never on any PID looked up fresh.
+    report["pid_ownership_verified"] = channel.process.is_running() and channel.process.pid is not None
+    report["heartbeat"] = {"received": channel.heartbeat_ok, "elapsed_s": round(time.monotonic() - t0, 2)}
+    if not channel.heartbeat_ok:
+        report["remaining_failures"].append("no heartbeat received within startup_timeout_s")
+
+    telem = None
+    if channel.heartbeat_ok:
+        # Paced polling (0.2s sleep), bounded to 5s - not a tight loop, and
+        # every call is non-blocking (receive_telemetry -> _poll_incoming
+        # uses recv_match(blocking=False)).
+        warm_deadline = time.monotonic() + 5.0
+        while time.monotonic() < warm_deadline:
+            telem = transport.receive_telemetry(SPAWN_VEHICLE_ID)
+            if channel.last_state_update_sim_s is not None:
+                break
+            time.sleep(0.2)
+        report["telemetry"]["received"] = channel.last_state_update_sim_s is not None
+        if telem is not None:
+            report["telemetry"]["fields"] = {
+                "position_m": telem.position_m, "battery_fraction": telem.battery_fraction,
+                "estimator_valid": telem.estimator_valid, "armed": telem.armed,
+                "flight_mode": str(telem.flight_mode) if telem.flight_mode else None,
+            }
+        if not report["telemetry"]["received"]:
+            report["remaining_failures"].append("no telemetry received within 5s of heartbeat")
+
+        # One safe, non-arming command: HOLD (a mode-change request, never
+        # arm/takeoff - see module docstring's "no arm/takeoff" guarantee).
+        adapter = build_ardupilot_sitl_adapter(SPAWN_VEHICLE_ID, transport)
+        adapter.connect()
+        now_s = telem.timestamp_s if telem is not None else 0.0
+        cmd = Command(vehicle_id=SPAWN_VEHICLE_ID, command_type=CommandType.HOLD, frame=Frame.LOCAL_ENU,
+                      desired_position_m=None, desired_velocity_mps=None, yaw_rad=None, yaw_rate_radps=None,
+                      timestamp_s=now_s, expiration_time_s=now_s + 5.0,
+                      source="spawn_verification", confidence=0.9)
+        report["command"]["sent"] = True
+        report["command"]["type"] = "HOLD"
+        result = adapter.send_command(AdapterCommand(command=cmd, sequence=0))
+        report["acknowledgement"] = {"received": True, "accepted": result.accepted, "reason": result.reason}
+        if not result.accepted:
+            report["remaining_failures"].append(f"HOLD command not accepted: {result.reason}")
+
+    # Clean shutdown + verify no child remains, regardless of what failed above.
+    stop_result = transport.stop()
+    report["shutdown"]["clean"] = stop_result.success
+    deadline = time.monotonic() + 5.0
+    while channel.process.is_running() and time.monotonic() < deadline:
+        time.sleep(0.1)  # paced, bounded
+    report["shutdown"]["exit_code"] = channel.process.exit_code
+    report["shutdown"]["no_child_remains"] = not channel.process.is_running()
+    if channel.process.is_running():
+        report["remaining_failures"].append("child process still running after stop()")
+
+    report["spawn_mode_complete"] = (
+        report["heartbeat"]["received"] and report["telemetry"]["received"]
+        and bool(report["acknowledgement"]["accepted"]) and bool(report["shutdown"]["no_child_remains"])
+        and not report["remaining_failures"]
+    )
+    return report
+
+
 def scenario_process_exit(real_sitl_available):
     def body(transport, adapters, result):
         v = VEHICLE_IDS[0]
@@ -544,8 +706,15 @@ def main():
             json.dump(result.to_dict(), f, indent=2, default=str)
         return
 
+    if "--spawn-local-sitl" in args:
+        result = scenario_spawn_local_sitl()
+        print(json.dumps(result, indent=2, default=str))
+        with open(os.path.join(OUT_DIR, "phase8_spawn_local_sitl_result.json"), "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        return
+
     if "--local-sitl" not in args:
-        print("Usage: python scripts/run_phase8_ardupilot_sitl.py --dry-run | --local-sitl")
+        print("Usage: python scripts/run_phase8_ardupilot_sitl.py --dry-run | --local-sitl | --spawn-local-sitl")
         sys.exit(2)
 
     real_sitl_available = _probe_real_sitl_reachable(n=2, timeout_s=3.0)

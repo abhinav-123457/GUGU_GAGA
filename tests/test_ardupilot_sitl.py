@@ -185,6 +185,8 @@ def test_process_handle_never_uses_shell_true():
     with patch("swarm_sim.sitl.ardupilot_transport.platform.system", return_value="Linux"), \
          patch("subprocess.Popen") as mock_popen:
         mock_popen.return_value.pid = 12345
+        mock_popen.return_value.stdout = None
+        mock_popen.return_value.stderr = None
         handle = _SITLProcessHandle(sys.executable, ["-c", "pass"])
         handle.start()
         _, kwargs = mock_popen.call_args
@@ -197,6 +199,14 @@ def test_process_handle_passes_argv_as_a_list_never_a_joined_string():
     with patch("swarm_sim.sitl.ardupilot_transport.platform.system", return_value="Linux"), \
          patch("subprocess.Popen") as mock_popen:
         mock_popen.return_value.pid = 1
+        # A real Popen's .stdout/.stderr are real pipe objects whose
+        # .readline() eventually returns "" at EOF; a MagicMock's does not,
+        # which would otherwise leave _SITLProcessHandle's background
+        # reader threads spinning forever against this mock. None mirrors
+        # "no such stream" and is what makes start() skip spawning a
+        # reader thread for it.
+        mock_popen.return_value.stdout = None
+        mock_popen.return_value.stderr = None
         handle = _SITLProcessHandle(sys.executable, ["-c", "print('a; rm -rf /'); "])
         handle.start()
         argv = mock_popen.call_args[0][0]

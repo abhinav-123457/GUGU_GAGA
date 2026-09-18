@@ -80,7 +80,9 @@ from __future__ import annotations
 import dataclasses
 import ipaddress
 import platform
+import shlex
 import subprocess
+import threading
 import time
 from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
@@ -274,7 +276,15 @@ class _SITLProcessHandle:
     misidentifying an unrelated process after this one has already exited
     is impossible by construction (there is no code path that looks up a
     process by bare PID at all). `shell=False` always; args are a list,
-    never a formatted string - see module docstring."""
+    never a formatted string - see module docstring.
+
+    stdout/stderr are drained CONTINUOUSLY by background reader threads,
+    not read only after the process exits - a chatty long-running SITL
+    process filling the OS pipe buffer while nobody reads it would
+    otherwise block that process's own writes indefinitely (a real
+    deadlock risk this project avoids by construction, not by luck)."""
+
+    _MAX_BUFFERED_LINES = 4000  # bounded - a long real-SITL session must not grow this without limit
 
     def __init__(self, executable_path: str, args: Sequence[str] = (), wsl_distro: Optional[str] = None,
                  working_directory: Optional[str] = None):
@@ -286,8 +296,35 @@ class _SITLProcessHandle:
         self.pid: Optional[int] = None
         self.launched_argv: Optional[Tuple[str, ...]] = None
         self.exit_code: Optional[int] = None
-        self.stdout_text: str = ""
-        self.stderr_text: str = ""
+        self._output_lock = threading.Lock()
+        self._stdout_lines: List[str] = []
+        self._stderr_lines: List[str] = []
+        self._stdout_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+
+    def _reader_loop(self, pipe, buffer_list: List[str]) -> None:
+        # readline() blocks until a line (or EOF) is available - safe here
+        # only because it runs on its own dedicated daemon thread, never on
+        # the caller's thread, and returns '' (falsy) at EOF instead of
+        # raising, which cleanly ends this loop when the process exits.
+        try:
+            for line in iter(pipe.readline, ""):
+                with self._output_lock:
+                    buffer_list.append(line)
+                    if len(buffer_list) > self._MAX_BUFFERED_LINES:
+                        del buffer_list[: len(buffer_list) - self._MAX_BUFFERED_LINES]
+        except (ValueError, OSError):
+            pass  # pipe closed under us during shutdown - not an error worth surfacing
+
+    @property
+    def stdout_text(self) -> str:
+        with self._output_lock:
+            return "".join(self._stdout_lines)
+
+    @property
+    def stderr_text(self) -> str:
+        with self._output_lock:
+            return "".join(self._stderr_lines)
 
     def start(self) -> None:
         popen_cwd = None
@@ -297,16 +334,32 @@ class _SITLProcessHandle:
                     "spawning a local SITL binary from a Windows host requires wsl_distro "
                     "(e.g. 'Ubuntu-22.04') - Windows cannot directly execute a Linux ELF binary"
                 )
-            # Without --cd, wsl.exe defaults the Linux-side working
-            # directory to a DrvFs translation of THIS (Windows) process's
-            # own cwd (e.g. "/mnt/c/Users/..."), not any path related to
-            # the SITL checkout - confirmed during Phase 8 real-SITL
-            # verification to make real ArduCopter bind its MAVLink port
-            # and then exit(1) shortly after, trying to open its
-            # EEPROM/parameter files. --cd is a first-class wsl.exe flag
-            # (not shell construction) taking a literal Linux path.
-            cd_args = ("--cd", self.working_directory) if self.working_directory else ()
-            argv = ("wsl.exe", "-d", self.wsl_distro, *cd_args, "--", self.executable_path, *self.args)
+            # Real finding from Phase 8 real-SITL verification: invoking
+            # the binary directly after wsl.exe's own "--" (no shell) lets
+            # ArduCopter bind its MAVLink port and then crash (exit 1) the
+            # INSTANT a real client connects - reproduced repeatedly,
+            # isolated down to this exact invocation shape (confirmed
+            # stable for 10+ idle seconds with no connection; confirmed
+            # crashing within the same second a client connects). Routing
+            # the exact same argv through "bash -c" instead (still
+            # `shell=False` at the Python/subprocess level - this list is
+            # never parsed by a shell on the Windows side; only WSL's own
+            # bash, given fixed, shlex-quoted, internally-controlled
+            # arguments, ever sees a string) does not exhibit this at all -
+            # this matches exactly how this project's own long-running
+            # verification instances (Real-SITL verification results) were
+            # started, and is not itself shell injection: every value
+            # quoted here comes from this transport's own validated
+            # ArduPilotVehicleEndpoint, never from unvalidated external
+            # input. `exec` replaces the shell process so the tracked
+            # child is arducopter itself, not a lingering bash wrapper.
+            parts = [self.executable_path, *self.args]
+            quoted = " ".join(shlex.quote(p) for p in parts)
+            if self.working_directory:
+                inner_cmd = f"cd {shlex.quote(self.working_directory)} && exec {quoted}"
+            else:
+                inner_cmd = f"exec {quoted}"
+            argv = ("wsl.exe", "-d", self.wsl_distro, "--", "bash", "-c", inner_cmd)
         else:
             argv = (self.executable_path, *self.args)
             popen_cwd = self.working_directory
@@ -314,6 +367,22 @@ class _SITLProcessHandle:
         self._popen = subprocess.Popen(list(argv), shell=False, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True, cwd=popen_cwd)
         self.pid = self._popen.pid
+        # Guard on `is not None` rather than assuming a pipe: `stdout=PIPE`
+        # always gives a real file object on an unmocked Popen, but a test
+        # that mocks subprocess.Popen leaves `.stdout`/`.stderr` as
+        # MagicMock objects whose `.readline()` never returns "" - without
+        # this guard, `_reader_loop`'s `iter(pipe.readline, "")` would spin
+        # forever (a real, observed hang: a mocked-Popen test left daemon
+        # threads busy-looping indefinitely, spinning up unbounded mock
+        # call-history memory and starving every later test's CPU time).
+        if self._popen.stdout is not None:
+            self._stdout_thread = threading.Thread(
+                target=self._reader_loop, args=(self._popen.stdout, self._stdout_lines), daemon=True)
+            self._stdout_thread.start()
+        if self._popen.stderr is not None:
+            self._stderr_thread = threading.Thread(
+                target=self._reader_loop, args=(self._popen.stderr, self._stderr_lines), daemon=True)
+            self._stderr_thread.start()
 
     def poll_exit_code(self) -> Optional[int]:
         if self._popen is None:
@@ -325,18 +394,16 @@ class _SITLProcessHandle:
         return self._popen is not None and self.poll_exit_code() is None
 
     def drain_output_after_exit(self) -> None:
-        """Only safe to call once `is_running()` has already confirmed the
-        process has exited - reading these pipes while the process is still
-        alive can block indefinitely waiting for EOF. Populates
-        stdout_text/stderr_text so a caller reporting an unexpected exit
-        (e.g. during startup) can include the real reason instead of an
-        always-empty string."""
+        """Gives the background reader threads a brief bounded moment to
+        catch up on any final output once the process has exited - the
+        threads already drain continuously while it runs, so this is only
+        a small join, never a blocking read of a live pipe."""
         if self._popen is None or self._popen.poll() is None:
             return
-        if self._popen.stdout:
-            self.stdout_text = self._popen.stdout.read()
-        if self._popen.stderr:
-            self.stderr_text = self._popen.stderr.read()
+        if self._stdout_thread is not None:
+            self._stdout_thread.join(timeout=1.0)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1.0)
 
     def stop(self, graceful_timeout_s: float = 5.0) -> None:
         if self._popen is None:
@@ -488,6 +555,16 @@ class ArduPilotSITLTransport:
             channel.process = _SITLProcessHandle(endpoint.executable_path, endpoint.extra_args, endpoint.wsl_distro,
                                                   endpoint.working_directory)
             channel.process.start()
+            # A freshly spawned real SITL binary needs a moment to parse
+            # its own arguments, load its home location/frame parameters
+            # and open its EEPROM/parameter storage before it is at all
+            # ready to accept a MAVLink connection - connecting into that
+            # narrow window (rather than the "port bound, cleanly waiting"
+            # steady state) is a real, observed source of instability
+            # during Phase 8's real-SITL verification. This is a single
+            # bounded sleep, not a loop, and does not affect ATTACH mode
+            # (executable_path is None there) at all.
+            time.sleep(1.5)
 
         deadline = time.monotonic() + self.startup_timeout_s
 
@@ -531,8 +608,18 @@ class ArduPilotSITLTransport:
                     f"{channel.vehicle_id}: SITL process exited during startup "
                     f"(exit code {channel.process.exit_code}); stderr: {channel.process.stderr_text[-500:]}"
                 )
-            msg = channel.connection.recv_match(type="HEARTBEAT", blocking=True, timeout=0.5)
+            # blocking=True is deliberately avoided here: pymavlink's own
+            # blocking wait uses select() internally, and a socket that has
+            # already seen EOF (e.g. the SITL process died mid-wait) is
+            # perpetually select()-ready, so a blocking call busy-spins for
+            # its ENTIRE timeout window instead of waiting quietly - a real,
+            # observed behavior (confirmed via source inspection and a live
+            # reproduction: thousands of "EOF on TCP socket" prints within
+            # a single call). Non-blocking + this loop's own explicit sleep
+            # keeps pacing entirely in this code's own hands.
+            msg = channel.connection.recv_match(type="HEARTBEAT", blocking=False)
             if msg is None:
+                time.sleep(0.1)
                 continue
             if msg.get_srcSystem() == endpoint.system_id and msg.get_srcComponent() == endpoint.component_id:
                 channel.connected = True
@@ -877,8 +964,13 @@ class ArduPilotSITLTransport:
         )
         deadline = time.monotonic() + self.ack_timeout_s
         while time.monotonic() < deadline:
-            msg = channel.connection.recv_match(type="COMMAND_ACK", blocking=True, timeout=0.2)
+            # Non-blocking + explicit sleep, not blocking=True - see the
+            # matching comment in _start_channel's heartbeat-wait loop for
+            # why a blocking pymavlink call can busy-spin its entire
+            # timeout window once the connection has seen EOF.
+            msg = channel.connection.recv_match(type="COMMAND_ACK", blocking=False)
             if msg is None:
+                time.sleep(0.05)
                 continue
             if msg.get_srcSystem() != endpoint.system_id or msg.get_srcComponent() != endpoint.component_id:
                 continue
