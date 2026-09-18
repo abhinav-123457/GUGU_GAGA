@@ -1,0 +1,53 @@
+# Phase 10 SITL-only bounded local geofence, appropriate for a <=2m
+# controlled-flight test - see docs/PHASE10_SITL_FLIGHT_TEST.md's
+# "SITL-only geofence configuration procedure" section for the full
+# derivation of each value against ArduPilot's own compiled-in defaults
+# (commit 92b0cd788ec29406f26c6f9c31d5ceedbd1cc538, Copter-4.6.3,
+# libraries/AC_Fence/AC_Fence.cpp).
+#
+# Apply this file AFTER Tools/autotest/default_params/copter.parm via
+# sim_vehicle.py's/arducopter's own documented --defaults mechanism, which
+# accepts a comma-separated list of parameter files applied in order (later
+# files override earlier ones). This is a SITL startup parameter file only -
+# nothing in swarm_sim ever writes these parameters at runtime (see
+# tests/test_phase10_sitl_flight_test_architecture.py::test_never_calls_param_set_anywhere_in_module).
+#
+# FENCE_ENABLE: master switch. Compiled-in default is 0 (disabled) -
+#   AP_GROUPINFO("ENABLE", 0, AC_Fence, _enabled, 0). Must be 1 for
+#   Phase 10's sitl_flight_test gate to pass at all.
+FENCE_ENABLE     1
+
+# FENCE_TYPE: bitmask (1=max altitude, 2=circle, 4=polygon, 8=min altitude).
+#   7 = ALT_MAX|CIRCLE|POLYGON is ArduPilot's own compiled-in default for
+#   Copter builds (AC_FENCE_TYPE_DEFAULT). Kept unchanged - it already
+#   covers both the altitude ceiling and a horizontal boundary. The min-
+#   altitude/floor fence (bit 8) is intentionally NOT enabled: this test's
+#   flight profile takes off from and lands at ground level and never goes
+#   below it, so a floor fence provides no protection value here.
+FENCE_TYPE       7
+
+# FENCE_ALT_MAX: altitude ceiling in meters. Compiled-in default is 100m -
+#   far too permissive for a 2m test. Set to 10m: 5x the default
+#   --max-altitude (2.0m) and well under the hard-coded code ceiling
+#   (HARD_MAX_ALTITUDE_M = 3.0m in run_phase10_sitl_flight_test.py), so the
+#   fence is a real, bounded backstop rather than a formality.
+FENCE_ALT_MAX    10
+
+# FENCE_RADIUS: horizontal boundary radius in meters, measured from home.
+#   Compiled-in default is 300m. This test's own manual flight sequence
+#   never sends a horizontal velocity/position setpoint at all (see
+#   run_sitl_flight_test's module docstring - GUIDED's own station-keeping
+#   after MAV_CMD_NAV_TAKEOFF is what "hold" means here), so any lateral
+#   drift should be near zero. 10m is a generous but still tightly bounded
+#   horizontal margin for that intended stationary hover.
+FENCE_RADIUS     10
+
+# FENCE_MARGIN: buffer distance in meters ArduPilot maintains from the
+#   fence boundary before treating it as breached. Left at ArduPilot's own
+#   compiled-in default (2.0m) - reasonable relative to the 10m radius
+#   above and not something this test needs to override.
+FENCE_MARGIN     2
+
+# FENCE_ACTION is intentionally left at ArduPilot's own compiled-in default
+# (1 = RTL_AND_LAND) - a conservative, already-safe breach response that
+# this file does not need to change.

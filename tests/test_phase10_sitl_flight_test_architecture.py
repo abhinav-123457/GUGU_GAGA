@@ -178,6 +178,31 @@ def test_no_num_drones_or_six_vehicle_configuration():
     assert "VEHICLE_IDS" not in identifiers
 
 
+# --- geofence gate requires FENCE_ENABLE, never writes a parameter ---------
+
+def test_geofence_gate_checks_fence_enabled():
+    gate_fn = _fn("_check_geofence_gate")
+    source = ast.get_source_segment(pathlib.Path(phase10_module.__file__).read_text(), gate_fn)
+    assert "fence_enabled" in source
+
+
+def test_geofence_gate_never_calls_param_set():
+    identifiers = _collect_identifiers(_fn("_check_geofence_gate"))
+    assert "param_set_send" not in identifiers
+    assert "mav_param_set_send" not in identifiers
+
+
+def test_flight_test_calls_geofence_gate_before_setting_mode_or_arming():
+    """The geofence gate must be evaluated (and, if failed, must stop)
+    before GUIDED mode is set or an arm command is sent."""
+    fn = _fn("run_sitl_flight_test")
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+    gate_calls = [c for c in calls if _call_name(c) == "_check_geofence_gate"]
+    mode_calls = [c for c in calls if _call_name(c) == "_set_mode_guided"]
+    assert gate_calls and mode_calls
+    assert min(c.lineno for c in gate_calls) < min(c.lineno for c in mode_calls)
+
+
 # --- no ARMING_CHECK=0 written, no parameter writes at all ------------------
 
 def test_never_calls_param_set_anywhere_in_module():

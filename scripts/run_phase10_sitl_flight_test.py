@@ -183,6 +183,27 @@ def _check_flight_test_gate(args) -> dict:
     return gate
 
 
+def _check_geofence_gate(fence_enable_value) -> dict:
+    """Live, post-attach gate - separate from `_check_flight_test_gate`
+    because `FENCE_ENABLE` can only be known from a real PARAM_VALUE read,
+    not from CLI args alone. Read-only: never sends `param_set_send`. See
+    docs/PHASE10_SITL_FLIGHT_TEST.md's "SITL-only geofence configuration
+    procedure" for how an operator enables this via ArduPilot's own
+    `--defaults` file mechanism - this project's own code never writes the
+    parameter for them."""
+    gate = {"passed": False, "checks": {}, "reasons_failed": []}
+
+    def require(name, condition, detail=None):
+        gate["checks"][name] = {"passed": bool(condition), "detail": detail}
+        if not condition:
+            gate["reasons_failed"].append(name)
+
+    require("fence_enabled", bool(fence_enable_value), fence_enable_value)
+
+    gate["passed"] = not gate["reasons_failed"]
+    return gate
+
+
 def _operator_confirmed(args) -> bool:
     if args.confirm_sitl_flight_test:
         return True
@@ -391,7 +412,8 @@ def run_sitl_flight_test(args) -> dict:
         "attach": {"succeeded": False, "reason": None}, "heartbeat": {"received": False},
         "identity_verified": False, "estimator_valid": None, "telemetry_valid": None,
         "initially_disarmed": None, "prearm_clear": None, "prearm_messages": [],
-        "battery_state": {}, "geofence_enabled": None, "version": {"confirmed": False, "raw": None},
+        "battery_state": {}, "geofence_enabled": None, "geofence_gate": None,
+        "version": {"confirmed": False, "raw": None},
         "events": [],
         "arm": {"attempted": False, "accepted": None, "confirmed_by_heartbeat": None, "statustexts": []},
         "takeoff": {"attempted": False, "accepted": None, "max_altitude_observed_m": None, "statustexts": []},
@@ -493,11 +515,15 @@ def run_sitl_flight_test(args) -> dict:
             ),
         }
         fence_enabled = gate_params.get("FENCE_ENABLE")
-        report["geofence_enabled"] = bool(fence_enabled)
-        if not report["geofence_enabled"]:
+        geofence_gate = _check_geofence_gate(fence_enabled)
+        report["geofence_gate"] = geofence_gate
+        report["geofence_enabled"] = geofence_gate["checks"]["fence_enabled"]["passed"]
+        if not geofence_gate["passed"]:
             report["remaining_failures"].append(
-                "FENCE_ENABLE is 0 (disabled) - geofence must be enabled before a flight test; set FENCE_ENABLE=1 "
-                "(and FENCE_TYPE/FENCE_ALT_MAX/FENCE_RADIUS) - see docs/PHASE10_SITL_FLIGHT_TEST.md"
+                f"geofence gate failed: {geofence_gate['reasons_failed']} - FENCE_ENABLE is 0 (disabled). "
+                "A bounded local geofence must be enabled before a flight test; see "
+                "docs/PHASE10_SITL_FLIGHT_TEST.md's SITL-only geofence configuration procedure "
+                "(FENCE_ENABLE=1, FENCE_TYPE=7, FENCE_ALT_MAX=10, FENCE_RADIUS=10, FENCE_MARGIN=2)."
             )
             return report
 

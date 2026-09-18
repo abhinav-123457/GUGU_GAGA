@@ -65,9 +65,18 @@ class _FlightSimVehicle(DummyArduPilotVehicle):
         self.arm_attempts = 0
         self.takeoff_attempts = 0
         self.land_attempts = 0
+        self.received_param_sets = []
 
     def _handle_message(self, msg):
         msg_type = msg.get_type()
+        if msg_type == "PARAM_SET":
+            # Recorder only - deliberately never applies the write, so a
+            # test can prove "no parameter write occurs in the project
+            # code" (requirement 9) by asserting this list stays empty,
+            # independent of the AST-based structural check in
+            # test_phase10_sitl_flight_test_architecture.py.
+            self.received_param_sets.append(msg)
+            return
         if msg_type == "PARAM_REQUEST_READ":
             pid = msg.param_id if isinstance(msg.param_id, str) else msg.param_id.decode()
             pid = pid.rstrip("\x00")
@@ -226,8 +235,55 @@ def test_flight_test_stops_if_geofence_disabled():
     try:
         report = phase10.run_sitl_flight_test(_args(port=port))
         assert report["geofence_enabled"] is False
+        assert report["geofence_gate"]["passed"] is False
+        assert "fence_enabled" in report["geofence_gate"]["reasons_failed"]
         assert report["arm"]["attempted"] is False
         assert v.armed is False
+    finally:
+        v.stop()
+
+
+def test_flight_test_geofence_gate_passes_with_bounded_fence_params(flight_sim):
+    """flight_sim seeds FENCE_ENABLE=1.0 alongside a realistic bounded local
+    fence (FENCE_TYPE/FENCE_ALT_MAX/FENCE_RADIUS matching
+    docs/phase10_sitl_geofence.parm) - the gate only requires FENCE_ENABLE
+    to be non-zero, and passing it must let the sequence proceed to arm."""
+    vehicle, port = flight_sim
+    args = _args(port=port, duration=1.0)
+    # Simulate the operator having applied the documented bounded-fence
+    # override file (FENCE_TYPE=7, FENCE_ALT_MAX=10, FENCE_RADIUS=10,
+    # FENCE_MARGIN=2) in addition to FENCE_ENABLE=1 already seeded above.
+    vehicle.params.update({"FENCE_TYPE": 7.0, "FENCE_ALT_MAX": 10.0, "FENCE_RADIUS": 10.0, "FENCE_MARGIN": 2.0})
+    report = phase10.run_sitl_flight_test(args)
+    assert report["geofence_gate"]["passed"] is True
+    assert report["geofence_gate"]["checks"]["fence_enabled"]["passed"] is True
+    assert report["arm"]["accepted"] is True
+    assert report["remaining_failures"] == []
+
+
+def test_flight_test_never_sends_param_set(flight_sim):
+    """No parameter write occurs in the project code (requirement 9): a
+    live, wire-level check (the vehicle records any PARAM_SET it receives -
+    see _FlightSimVehicle._handle_message) that a full flight-test sequence
+    never sends one, including ARMING_CHECK. Complements the AST-based
+    structural check in test_phase10_sitl_flight_test_architecture.py
+    (no `param_set_send` call exists anywhere in the module)."""
+    vehicle, port = flight_sim
+    report = phase10.run_sitl_flight_test(_args(port=port, duration=1.0))
+    assert report["remaining_failures"] == []
+    assert vehicle.received_param_sets == []
+    assert vehicle.params["ARMING_CHECK"] == 1.0   # remains enabled - never touched
+
+
+def test_prearm_diagnostics_never_sends_param_set():
+    port = _next_port()
+    v = _FlightSimVehicle(port=port, system_id=1, component_id=1,
+                          params={"ARMING_CHECK": 1.0, "BATT_MONITOR": 4.0, "FENCE_ENABLE": 0.0})
+    v.start()
+    try:
+        report = phase10.run_prearm_diagnostics(_args(port=port, startup_timeout=3.0))
+        assert report["attach"]["succeeded"] is True
+        assert v.received_param_sets == []
     finally:
         v.stop()
 

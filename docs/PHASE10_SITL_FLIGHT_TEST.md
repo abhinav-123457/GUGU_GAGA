@@ -167,16 +167,67 @@ Tools/autotest/sim_vehicle.py -v ArduCopter --no-mavproxy -I0 \
     --home=-35.363261,149.165230,584,353 --sysid=1
 ```
 
-**Geofence**: neither command above enables the geofence.
-`AC_Fence.cpp`'s own compiled-in default is `AP_GROUPINFO("ENABLE", 0,
-AC_Fence, _enabled, 0)` - disabled. `sitl_flight_test` mode (Step 2) gates
-on `FENCE_ENABLE != 0`, so the operator must additionally set
-`FENCE_ENABLE=1` (and reasonable `FENCE_TYPE`/`FENCE_ALT_MAX`/`FENCE_RADIUS`
-values, e.g. an altitude fence around 4-5m for this test's 2m target) via
-Mission Planner's parameter list or a further `--defaults` addition
-before a flight test can pass the gate. This project's own code never
-writes this parameter for the operator - see "prefer the standard
-procedure ... rather than manually patching parameters."
+### SITL-only geofence configuration procedure (required - `FENCE_ENABLE=0` blocks the flight-test gate)
+
+Neither command above enables the geofence. `AC_Fence.cpp`'s own
+compiled-in default (commit `92b0cd78`) is `AP_GROUPINFO("ENABLE", 0,
+AC_Fence, _enabled, 0)` - disabled. `run_sitl_flight_test`'s
+`_check_geofence_gate()` reads the live `FENCE_ENABLE` parameter after
+attach and refuses to proceed (no GUIDED mode change, no arm command) if it
+is `0` - confirmed live in this session's own diagnostic run
+(`FENCE_ENABLE=0.0`, all other diagnostics clean).
+
+**Exact parameters and the bounded values this project recommends**, all
+read from `libraries/AC_Fence/AC_Fence.cpp` at commit `92b0cd78`:
+
+| Parameter | Compiled-in default | Recommended bounded value for this 2m test | Reason |
+|---|---|---|---|
+| `FENCE_ENABLE` | `0` (disabled) | `1` | Required - `_check_geofence_gate` refuses to proceed while this is `0`. |
+| `FENCE_TYPE` | `7` (`ALT_MAX\|CIRCLE\|POLYGON`) | `7` (unchanged) | Already covers an altitude ceiling and a horizontal boundary; the min-altitude/floor bit (`8`) is intentionally left out - this test's flight never goes below ground level, so a floor fence adds no protection. |
+| `FENCE_ALT_MAX` | `100.0` m | `10` m | 5x the default `--max-altitude` (2.0m) and under the code's own hard cap (`HARD_MAX_ALTITUDE_M = 3.0` m) - a real, bounded backstop instead of a 100m formality. |
+| `FENCE_RADIUS` | `300.0` m (`copter.parm` itself sets `150.0` m) | `10` m | This test's manual sequence never sends a horizontal setpoint at all (GUIDED's own station-keeping after `MAV_CMD_NAV_TAKEOFF` is what "hold" means here), so 10m is a generous but still tightly bounded horizontal margin around a vehicle that should not be drifting anywhere. |
+| `FENCE_MARGIN` | `2.0` m | `2` m (unchanged) | ArduPilot's own default buffer distance before a breach is declared - reasonable relative to a 10m radius, no override needed. |
+| `FENCE_ACTION` | `1` (`RTL_AND_LAND`) | `1` (unchanged) | Already a conservative, safe breach response. |
+
+**Exact operator configuration command** (documented `--defaults`
+mechanism - `sim_vehicle.py`/`arducopter` both accept a comma-separated
+list of parameter files, applied in order, later files overriding
+earlier ones; this is ArduPilot's own official mechanism, not something
+this project invented):
+
+```bash
+cd /home/swarmbuild/ardupilot
+./build/sitl/bin/arducopter \
+    --model quad \
+    --speedup 1 \
+    -I0 \
+    --home -35.363261,149.165230,584,353 \
+    --sysid 1 \
+    --defaults Tools/autotest/default_params/copter.parm,/mnt/c/Users/abhin/OneDrive/Desktop/swarm/docs/phase10_sitl_geofence.parm
+```
+
+The second file is this project's own
+[`docs/phase10_sitl_geofence.parm`](phase10_sitl_geofence.parm), containing
+exactly the six lines in the table above with their reasoning as comments.
+It is a **SITL startup parameter file**, applied once at EEPROM/parameter
+load time by ArduPilot itself - not a runtime write. Nothing in
+`swarm_sim`/`scripts/run_phase10_sitl_flight_test.py` ever calls
+`param_set`/`param_set_send` (see
+`tests/test_phase10_sitl_flight_test_architecture.py::test_never_calls_param_set_anywhere_in_module`
+and the new
+`test_geofence_gate_never_calls_param_set`/`test_flight_test_never_sends_param_set`
+tests, which additionally prove this live at the wire level via the test
+double).
+
+**Restart required**: `--defaults` is only read at process startup - an
+already-running `arducopter` instance must be stopped and relaunched with
+the command above for `FENCE_ENABLE`/`FENCE_TYPE`/`FENCE_ALT_MAX`/`FENCE_RADIUS`
+to take effect. A parameter change made live afterwards (e.g. via Mission
+Planner's or MAVProxy's own `param set FENCE_ENABLE 1` - also a
+documented, official ArduPilot mechanism, just an operator command instead
+of a file) does not require a restart and is an acceptable alternative to
+editing the defaults file, but this project's own code still never issues
+that command on the operator's behalf.
 
 ## An environment-level finding from this phase's own diagnosis (read before attempting a live test)
 
@@ -235,7 +286,7 @@ during `run_sitl_flight_test` itself):
 | valid estimator state | live - `telemetry.estimator_valid` |
 | valid telemetry | live - `telemetry.position_m is not None` |
 | valid battery state or documented SITL battery model | live - either a real reading, or an explicit "`BATT_MONITOR` disabled, documented SITL default" note - never fabricated |
-| geofence enabled | live - `FENCE_ENABLE` parameter read, must be non-zero |
+| geofence enabled | live - `_check_geofence_gate()` reads `FENCE_ENABLE`, must be non-zero; a bounded local fence (`FENCE_TYPE`/`FENCE_ALT_MAX`/`FENCE_RADIUS`/`FENCE_MARGIN`) is separately recommended - see the "SITL-only geofence configuration procedure" above |
 | command timeout configured | gate - `_ARM_TAKEOFF_LAND_COMMAND_TIMEOUT_S` finite and positive |
 | operator acknowledgement | `--confirm-sitl-flight-test`, or an interactive `yes` prompt if stdin is a tty |
 | no hardware endpoint | structural - only `ArduPilotVehicleEndpoint` with `executable_path=None` (ATTACH only) is ever constructed |
@@ -255,7 +306,7 @@ Implemented in `run_sitl_flight_test()`:
 3. Confirm ArduPilot version (`AUTOPILOT_VERSION`).
 4. Verify telemetry and estimator validity.
 5. Verify vehicle is disarmed (refuses to proceed if already armed).
-6. Verify battery state / geofence enabled.
+6. Verify battery state, and evaluate the geofence gate (`_check_geofence_gate()` - refuses to proceed while live `FENCE_ENABLE` reads `0`).
 7. Verify pre-arm STATUSTEXT stream is clear (no `PreArm: ...` messages in a 6s window).
 8. Set GUIDED mode, wait for a real `COMMAND_ACK`.
 9. Send arm (`MAV_CMD_COMPONENT_ARM_DISARM`, `param1=1`, `param2=0` - **never** the force-arm magic value) only now that every check above has passed.
@@ -348,26 +399,34 @@ via AST inspection of `scripts/run_phase10_sitl_flight_test.py`:
 - no `distributed_consensus`/`pybullet`/`FloodSearchMission` reference exists;
 - the manual flight path never calls `ArduPilotSITLTransport.send_command()`;
 - `ardupilot_transport.py` itself (Phase 8, unmodified) still never references an arm/takeoff identifier (regression re-check);
-- Phase 9's own module is imported, not reimplemented.
+- Phase 9's own module is imported, not reimplemented;
+- `_check_geofence_gate()` literally checks `fence_enabled`, never calls `param_set_send`/`mav_param_set_send`;
+- `run_sitl_flight_test` calls `_check_geofence_gate()` before setting GUIDED mode or arming.
 
-`tests/test_phase10_sitl_flight_test.py` (21 tests) proves the behavioral
+`tests/test_phase10_sitl_flight_test.py` (26 tests) proves the behavioral
 side against `_FlightSimVehicle` (a test-only, real-MAVLink-over-localhost
 extension of Phase 8/9's own `DummyArduPilotVehicle`, living entirely in
 this test file - the shared fixture itself is never modified): every
 required gate individually refuses to arm when missing; wrong system ID
-is rejected; geofence-disabled is rejected; a rejected arm attempt is
-never retried or bypassed and the vehicle never reports armed; a full
+is rejected; `FENCE_ENABLE=0` blocks flight-test authorization
+(`geofence_gate["passed"] is False`); `FENCE_ENABLE=1` with a realistic
+bounded local fence (`FENCE_TYPE=7`/`FENCE_ALT_MAX=10`/`FENCE_RADIUS=10`/`FENCE_MARGIN=2`,
+matching `docs/phase10_sitl_geofence.parm`) passes that gate and lets the
+sequence proceed to arm; a rejected arm attempt is never retried or
+bypassed and the vehicle never reports armed; a full
 happy-path arm-takeoff-hold-land-disarm sequence produces a real,
-non-trivial observed altitude climb and an honest report; a takeoff
+non-trivial observed altitude climb and an honest report, and an
+independent live check confirms `ARMING_CHECK` was never touched and no
+`PARAM_SET` was ever sent; a takeoff
 rejected after a successful arm triggers the emergency LAND/disarm path;
-`prearm_diagnostics` reads real parameters and never sends an arm
-command; `--attach` delegates to Phase 9's own function; and FakeSITL
-remains importable and functional.
+`prearm_diagnostics` reads real parameters, never sends an arm command,
+and never sends a `PARAM_SET`; `--attach` delegates to Phase 9's own
+function; and FakeSITL remains importable and functional.
 
 ## Mission Planner observation procedure
 
-1. Start ArduCopter SITL with the standard-procedure command above (Step 1).
-2. Set `FENCE_ENABLE=1` (and `FENCE_TYPE`/`FENCE_ALT_MAX`/`FENCE_RADIUS`) via Mission Planner's parameter list, since the flight-test gate requires it.
+1. Start ArduCopter SITL with the standard-procedure command above (Step 1), extended with the geofence `--defaults` file from the "SITL-only geofence configuration procedure" section (`--defaults Tools/autotest/default_params/copter.parm,docs/phase10_sitl_geofence.parm`) - this requires a fresh restart, not a live parameter change, since `--defaults` is only read at startup.
+2. Alternatively, without restarting: set `FENCE_ENABLE=1`, `FENCE_TYPE=7`, `FENCE_ALT_MAX=10`, `FENCE_RADIUS=10`, `FENCE_MARGIN=2` via Mission Planner's parameter list (a documented, official ArduPilot mechanism - this project's own code never issues this write itself).
 3. Confirm in Mission Planner's HUD that `PreArm` messages have cleared and battery shows a real value.
 4. Run `python scripts/run_phase10_sitl_flight_test.py --diagnose-prearm ...` first and confirm a clean report.
 5. Watch Mission Planner's map/HUD while a human operator runs the flight-test command with explicit confirmation - the vehicle icon should climb to the configured altitude, hold, then descend and show `DISARMED` again.
@@ -379,7 +438,9 @@ python -m compileall -q swarm_sim run_mission.py tests scripts
 python -m pytest -q tests
 ```
 
-Both were run in this session: **624 tests passed**, compile clean.
+Both were run in this session: **630 tests passed**, compile clean (up
+from 624 - 5 new functional tests plus 3 new architecture tests for the
+geofence gate, minus 2 removed/merged in the earlier gate-flag test fix).
 
 ## Results (this session)
 
@@ -393,3 +454,32 @@ Nothing in this phase claims flight success without an actually-observed,
 non-trivial altitude change - see `report["flight_actually_happened"]`,
 which is only ever set `True` after a real climb is observed via live
 telemetry.
+
+## Update: geofence gate formalized, live pre-arm diagnostic now confirmed clean
+
+In a later session, the operator reported running `--diagnose-prearm`
+against a real, live ArduCopter SITL instance (the environment-level
+connection regression above no longer reproduced on their host) and got a
+clean report: heartbeat received, attach succeeded, `ARMING_CHECK=1`,
+accelerometer offsets non-zero, `BATT_MONITOR=4`, battery fraction `1.0`,
+no pre-arm messages, clean shutdown - **except** `FENCE_ENABLE=0.0`. This
+independently confirms the Step 1 diagnosis above against a real vehicle,
+not just the simulated test double.
+
+In response, the geofence check (previously an inline check inside
+`run_sitl_flight_test`) was formalized into its own `_check_geofence_gate()`
+function, given its own `report["geofence_gate"]` result shape (matching
+`_check_flight_test_gate`'s `{"passed", "checks", "reasons_failed"}`
+shape), and documented above under "SITL-only geofence configuration
+procedure" with an exact bounded-fence parameter file
+([`docs/phase10_sitl_geofence.parm`](phase10_sitl_geofence.parm)). This did
+**not** change: `telemetry_only`/`prearm_diagnostics` modes (untouched);
+`ARMING_CHECK` (never referenced as a value to write, before or after);
+whether the code arms/takes off by default (still never, and the live
+arm/takeoff/land test was **still not run** in this update - only
+`--diagnose-prearm` was reported as run, which never arms). No parameter
+write was added anywhere - see the new
+`test_geofence_gate_never_calls_param_set` (AST) and
+`test_flight_test_never_sends_param_set`/`test_prearm_diagnostics_never_sends_param_set`
+(live, wire-level: the test double now records any `PARAM_SET` it
+receives and both tests assert that list stays empty) tests.
