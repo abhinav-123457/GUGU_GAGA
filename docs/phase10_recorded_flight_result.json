@@ -1,0 +1,166 @@
+{
+  "mode": "sitl_flight_test",
+  "namespace": "sitl/drone0",
+  "connection_string": "tcp:127.0.0.1:5760",
+  "system_id": 1,
+  "component_id": 1,
+  "gate": {
+    "passed": true,
+    "checks": {
+      "sitl_only_flag": {
+        "passed": true,
+        "detail": null
+      },
+      "allow_sitl_arm_test_flag": {
+        "passed": true,
+        "detail": null
+      },
+      "namespace_is_sitl_drone0": {
+        "passed": true,
+        "detail": "sitl/drone0"
+      },
+      "max_altitude_within_hard_cap": {
+        "passed": true,
+        "detail": 2.0
+      },
+      "max_speed_within_hard_cap": {
+        "passed": true,
+        "detail": 0.5
+      },
+      "duration_within_hard_cap": {
+        "passed": true,
+        "detail": 60.0
+      },
+      "system_id_configured": {
+        "passed": true,
+        "detail": 1
+      },
+      "component_id_configured": {
+        "passed": true,
+        "detail": 1
+      },
+      "pymavlink_available": {
+        "passed": true,
+        "detail": null
+      },
+      "command_timeout_configured": {
+        "passed": true,
+        "detail": null
+      },
+      "heartbeat_timeout_configured": {
+        "passed": true,
+        "detail": null
+      },
+      "localhost_connection": {
+        "passed": true,
+        "detail": "127.0.0.1"
+      }
+    },
+    "reasons_failed": []
+  },
+  "operator_confirmed": true,
+  "attach": {
+    "succeeded": true,
+    "reason": null
+  },
+  "heartbeat": {
+    "received": true
+  },
+  "identity_verified": true,
+  "estimator_valid": true,
+  "telemetry_valid": true,
+  "initially_disarmed": true,
+  "prearm_clear": true,
+  "prearm_messages": [],
+  "battery_state": {
+    "monitor_param_value": 4.0,
+    "battery_fraction": 0.85,
+    "documented_sitl_model": "battery monitor configured - live reading used"
+  },
+  "geofence_enabled": true,
+  "geofence_gate": {
+    "passed": true,
+    "checks": {
+      "fence_enabled": {
+        "passed": true,
+        "detail": 1.0
+      }
+    },
+    "reasons_failed": []
+  },
+  "version": {
+    "confirmed": true,
+    "raw": {
+      "flight_sw_version": 67503103
+    }
+  },
+  "events": [
+    {
+      "monotonic_s": 110520.796,
+      "event": "attached"
+    },
+    {
+      "monotonic_s": 110527.234,
+      "event": "mode_set_guided",
+      "accepted": true
+    },
+    {
+      "monotonic_s": 110527.281,
+      "event": "arm_attempt",
+      "accepted": true,
+      "result": 0
+    },
+    {
+      "monotonic_s": 110528.406,
+      "event": "armed_confirmed"
+    },
+    {
+      "monotonic_s": 110528.468,
+      "event": "takeoff_attempt",
+      "accepted": true,
+      "result": 0
+    },
+    {
+      "monotonic_s": 110533.312,
+      "event": "takeoff_confirmed",
+      "altitude_m": 1.720716118812561
+    },
+    {
+      "monotonic_s": 110593.406,
+      "event": "hold_complete"
+    },
+    {
+      "monotonic_s": 110593.421,
+      "event": "land_attempt",
+      "accepted": true,
+      "result": 0
+    }
+  ],
+  "arm": {
+    "attempted": true,
+    "accepted": true,
+    "confirmed_by_heartbeat": true,
+    "statustexts": []
+  },
+  "takeoff": {
+    "attempted": true,
+    "accepted": true,
+    "max_altitude_observed_m": 1.720716118812561,
+    "statustexts": []
+  },
+  "hold": {
+    "duration_s": 60.0,
+    "sample_count": 59
+  },
+  "land": {
+    "attempted": true,
+    "accepted": true
+  },
+  "disarm_confirmed": true,
+  "emergency_action": null,
+  "shutdown": {
+    "clean": true
+  },
+  "remaining_failures": [],
+  "flight_actually_happened": true
+}
