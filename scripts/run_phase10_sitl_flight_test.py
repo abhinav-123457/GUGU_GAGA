@@ -15,7 +15,9 @@ report shape):
     --diagnose-prearm
         Read-only: attaches, reads a fixed set of parameters
         (ARMING_CHECK, INS_ACCOFFS_*/INS_ACCSCAL_*, BATT_MONITOR,
-        FENCE_ENABLE) and listens for ArduPilot's own STATUSTEXT
+        FENCE_ENABLE/FENCE_TYPE/FENCE_ALT_MAX/FENCE_RADIUS/FENCE_MARGIN/
+        FENCE_ACTION - the last six also surfaced in their own
+        report["geofence"] section) and listens for ArduPilot's own STATUSTEXT
         "PreArm: ..." messages (ArduPilot broadcasts these on its own,
         continuously, whenever a check fails - no arm attempt is sent or
         needed). Never writes a parameter, never arms.
@@ -258,7 +260,14 @@ def run_dry_run(args) -> dict:
 
 _DIAGNOSTIC_PARAM_NAMES = (
     "ARMING_CHECK", "INS_ACCOFFS_X", "INS_ACCOFFS_Y", "INS_ACCOFFS_Z",
-    "INS_ACCSCAL_X", "INS_ACC2OFFS_X", "INS_ACC2SCAL_X", "BATT_MONITOR", "FENCE_ENABLE",
+    "INS_ACCSCAL_X", "INS_ACC2OFFS_X", "INS_ACC2SCAL_X", "BATT_MONITOR",
+    "FENCE_ENABLE", "FENCE_TYPE", "FENCE_ALT_MAX", "FENCE_RADIUS", "FENCE_MARGIN", "FENCE_ACTION",
+)
+
+# Reported verbatim in run_prearm_diagnostics's report["geofence"] - read-only,
+# no gate/safety behavior change (see _check_geofence_gate, unmodified).
+_GEOFENCE_REPORT_PARAM_NAMES = (
+    "FENCE_ENABLE", "FENCE_TYPE", "FENCE_ALT_MAX", "FENCE_RADIUS", "FENCE_MARGIN", "FENCE_ACTION",
 )
 
 
@@ -300,7 +309,7 @@ def run_prearm_diagnostics(args) -> dict:
         "system_id": args.system_id, "component_id": args.component_id,
         "attach": {"succeeded": False, "reason": None}, "heartbeat": {"received": False},
         "parameters": {}, "statustexts": [], "prearm_messages": [],
-        "battery": {}, "diagnosis": {}, "shutdown": {"clean": False}, "remaining_failures": [],
+        "battery": {}, "geofence": {}, "diagnosis": {}, "shutdown": {"clean": False}, "remaining_failures": [],
     }
     vehicle_id, endpoint, allowed_ports = phase9._try_build_endpoint(args, report)
     if vehicle_id is None:
@@ -330,6 +339,13 @@ def run_prearm_diagnostics(args) -> dict:
         "monitor_configured": bool(batt_monitor),
         "battery_fraction_reported": telem.battery_fraction,
     }
+    # Reporting-only: surfaces the same read-only parameters
+    # _check_geofence_gate() itself gates on, plus the rest of the fence
+    # shape, for operator visibility. Does not change the gate, any
+    # safety behavior, or what's written (nothing is ever written) -
+    # values are simply copied from report["parameters"] when present,
+    # None otherwise ("when available").
+    report["geofence"] = {name: report["parameters"].get(name) for name in _GEOFENCE_REPORT_PARAM_NAMES}
 
     accel_offsets = [report["parameters"].get(n) for n in ("INS_ACCOFFS_X", "INS_ACCOFFS_Y", "INS_ACCOFFS_Z")]
     seen_offsets = [v for v in accel_offsets if v is not None]

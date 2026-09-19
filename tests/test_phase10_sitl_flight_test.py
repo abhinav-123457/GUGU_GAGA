@@ -391,6 +391,44 @@ def test_prearm_diagnostics_reads_params_and_never_arms():
         v.stop()
 
 
+def test_prearm_diagnostics_reports_geofence_values_when_available():
+    port = _next_port()
+    v = _FlightSimVehicle(port=port, system_id=1, component_id=1,
+                          params={"ARMING_CHECK": 1.0, "BATT_MONITOR": 4.0, "FENCE_ENABLE": 1.0,
+                                  "FENCE_TYPE": 7.0, "FENCE_ALT_MAX": 10.0, "FENCE_RADIUS": 10.0,
+                                  "FENCE_MARGIN": 2.0, "FENCE_ACTION": 1.0})
+    v.start()
+    try:
+        report = phase10.run_prearm_diagnostics(_args(port=port, startup_timeout=3.0))
+        assert report["geofence"] == {
+            "FENCE_ENABLE": 1.0, "FENCE_TYPE": 7.0, "FENCE_ALT_MAX": 10.0,
+            "FENCE_RADIUS": 10.0, "FENCE_MARGIN": 2.0, "FENCE_ACTION": 1.0,
+        }
+        assert v.armed is False
+        assert v.received_param_sets == []   # reporting-only - still never writes
+    finally:
+        v.stop()
+
+
+def test_prearm_diagnostics_reports_geofence_none_when_unavailable():
+    """"when available" (requirement wording) - a param the vehicle never
+    answers must show up as None, never fabricated or omitted."""
+    port = _next_port()
+    v = _FlightSimVehicle(port=port, system_id=1, component_id=1,
+                          params={"ARMING_CHECK": 1.0, "FENCE_ENABLE": 0.0})
+    v.start()
+    try:
+        report = phase10.run_prearm_diagnostics(_args(port=port, startup_timeout=3.0))
+        assert report["geofence"]["FENCE_ENABLE"] == 0.0
+        assert report["geofence"]["FENCE_TYPE"] is None
+        assert report["geofence"]["FENCE_ALT_MAX"] is None
+        assert report["geofence"]["FENCE_RADIUS"] is None
+        assert report["geofence"]["FENCE_MARGIN"] is None
+        assert report["geofence"]["FENCE_ACTION"] is None
+    finally:
+        v.stop()
+
+
 def test_prearm_diagnostics_detects_calibrated_accel_offsets():
     port = _next_port()
     v = _FlightSimVehicle(port=port, system_id=1, component_id=1,
