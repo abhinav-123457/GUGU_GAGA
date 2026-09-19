@@ -206,6 +206,23 @@ cd /home/swarmbuild/ardupilot
     --defaults Tools/autotest/default_params/copter.parm,/mnt/c/Users/abhin/OneDrive/Desktop/swarm/docs/phase10_sitl_geofence.parm
 ```
 
+**The second path must be absolute (or otherwise resolvable from the
+directory `arducopter` is launched from), not a path relative to the
+`swarm` project.** `arducopter` is launched with its working directory set
+to the ArduPilot checkout (`/home/swarmbuild/ardupilot` above) - a bare
+`docs/phase10_sitl_geofence.parm` resolves against *that* directory, which
+has its own unrelated `docs/` folder, not this project's. Getting this
+wrong produces exactly `PANIC: Failed to load defaults from
+Tools/autotest/default_params/copter.parm,docs/phase10_sitl_geofence.parm`
+(source-confirmed: `AP_Param::load_defaults_file()` in
+`libraries/AP_Param/AP_Param.cpp` `strtok_r`-splits the comma list
+correctly, then calls `count_defaults_in_file()` on each path in turn and
+panics with the *original, unsplit* string if any single one can't be
+opened - so the panic text doesn't tell you which of the two paths
+failed). Use the WSL path to wherever this project is actually checked
+out, e.g. for a project at Windows path `C:\Users\<you>\...\swarm`, the
+WSL2-mounted equivalent is `/mnt/c/Users/<you>/.../swarm/docs/phase10_sitl_geofence.parm`.
+
 The second file is this project's own
 [`docs/phase10_sitl_geofence.parm`](phase10_sitl_geofence.parm), containing
 exactly the six lines in the table above with their reasoning as comments.
@@ -425,7 +442,7 @@ function; and FakeSITL remains importable and functional.
 
 ## Mission Planner observation procedure
 
-1. Start ArduCopter SITL with the standard-procedure command above (Step 1), extended with the geofence `--defaults` file from the "SITL-only geofence configuration procedure" section (`--defaults Tools/autotest/default_params/copter.parm,docs/phase10_sitl_geofence.parm`) - this requires a fresh restart, not a live parameter change, since `--defaults` is only read at startup.
+1. Start ArduCopter SITL with the standard-procedure command above (Step 1), extended with the geofence `--defaults` file from the "SITL-only geofence configuration procedure" section (`--defaults Tools/autotest/default_params/copter.parm,<absolute-path-to-swarm>/docs/phase10_sitl_geofence.parm` - the second path must be absolute, see that section's warning about `arducopter`'s working directory) - this requires a fresh restart, not a live parameter change, since `--defaults` is only read at startup.
 2. Alternatively, without restarting: set `FENCE_ENABLE=1`, `FENCE_TYPE=7`, `FENCE_ALT_MAX=10`, `FENCE_RADIUS=10`, `FENCE_MARGIN=2` via Mission Planner's parameter list (a documented, official ArduPilot mechanism - this project's own code never issues this write itself).
 3. Confirm in Mission Planner's HUD that `PreArm` messages have cleared and battery shows a real value.
 4. Run `python scripts/run_phase10_sitl_flight_test.py --diagnose-prearm ...` first and confirm a clean report.
