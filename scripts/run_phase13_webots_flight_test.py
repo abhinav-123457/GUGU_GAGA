@@ -86,6 +86,7 @@ except ImportError:
 OUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results",
                         "phase13_webots_flight_test")
 CSV_PATH = os.path.join(OUT_DIR, "flight_log.csv")
+ACTUATOR_CSV_PATH = os.path.join(OUT_DIR, "actuator_log.csv")
 
 # Conservative, hard-coded safety ceilings - defense in depth ON TOP OF (never
 # instead of) the CLI's own validated arguments.
@@ -107,6 +108,12 @@ _CSV_FIELDS = (
     "roll_rad", "pitch_rad", "yaw_rad",
     "armed", "mode", "battery_fraction", "fence_enabled",
     "servo1_raw", "servo2_raw", "servo3_raw", "servo4_raw",
+)
+
+_ACTUATOR_CSV_FIELDS = (
+    "wall_time_s", "sitl_time_s", "event",
+    "servo1_raw", "servo2_raw", "servo3_raw", "servo4_raw",
+    "armed", "mode", "altitude_agl_m",
 )
 
 _SAFETY_BANNER = (
@@ -357,7 +364,16 @@ class _CsvLogger:
     """Independent flight-log writer - see docs/PHASE13_WEBOTS_FLIGHT_TEST.md
     for the honest scope of each field (Webots' own simulation time and
     realtime factor are not obtainable via MAVLink and are reported as such
-    in the JSON report, not fabricated into this CSV)."""
+    in the JSON report, not fabricated into this CSV).
+
+    `servo1_raw`..`servo4_raw` are read from the already-attached `channel`
+    object (`ArduPilotSITLTransport`'s own per-vehicle state, kept current
+    by its existing non-blocking `_poll_incoming` drain - see
+    swarm_sim/sitl/ardupilot_transport.py) rather than by this class making
+    its own competing `recv_match()` call. A second, independent reader of
+    the same socket would either miss messages `_poll_incoming` already
+    consumed for HEARTBEAT/position/attitude, or itself consume one of
+    those - this class never does that."""
 
     def __init__(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -367,11 +383,11 @@ class _CsvLogger:
         self._start = time.monotonic()
         self.max_altitude_agl_m = 0.0
         self.last_servo = (None, None, None, None)
+        self.hold_altitudes_m = []
 
-    def log(self, conn, event, telem):
-        servo = conn.recv_match(type="SERVO_OUTPUT_RAW", blocking=False)
-        if servo is not None:
-            self.last_servo = (servo.servo1_raw, servo.servo2_raw, servo.servo3_raw, servo.servo4_raw)
+    def log(self, event, telem, channel=None):
+        if channel is not None and channel.last_servo_output_raw is not None:
+            self.last_servo = channel.last_servo_output_raw
         row = {"wall_time_s": time.monotonic() - self._start, "event": event}
         if telem is not None:
             row["sitl_time_s"] = telem.timestamp_s
@@ -379,6 +395,8 @@ class _CsvLogger:
                 row["east_m"], row["north_m"], row["up_m"] = telem.position_m
                 row["altitude_agl_m"] = telem.position_m[2]
                 self.max_altitude_agl_m = max(self.max_altitude_agl_m, telem.position_m[2])
+                if event == "hold":
+                    self.hold_altitudes_m.append(telem.position_m[2])
             if telem.velocity_mps is not None:
                 row["ve_mps"], row["vn_mps"], row["vu_mps"] = telem.velocity_mps
             if telem.attitude_rad is not None:
@@ -391,6 +409,139 @@ class _CsvLogger:
 
     def close(self):
         self._file.close()
+
+
+class _ActuatorLogger:
+    """Dedicated, honest actuator-output (SERVO_OUTPUT_RAW) log - kept
+    separate from the main per-tick flight log so a genuinely missing
+    actuator stream shows up as a short/empty file, not as blank columns
+    buried inside an otherwise-full CSV.
+
+    Never reads the socket itself - relies entirely on
+    `ArduPilotSITLTransport`'s own bounded, non-blocking per-tick drain
+    (`_poll_incoming`), so this class can never block the control loop
+    waiting for a SERVO_OUTPUT_RAW message that may never arrive. `.poll()`
+    writes a row only when `channel.servo_output_messages_received` has
+    actually increased since the last call - it never fabricates a row for
+    a tick where nothing new arrived, and `rows_written` versus the number
+    of `.poll()` calls is the honest measure of how many ticks had real
+    actuator evidence versus how many did not."""
+
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self._file = open(path, "w", newline="")
+        self._writer = csv.DictWriter(self._file, fieldnames=_ACTUATOR_CSV_FIELDS)
+        self._writer.writeheader()
+        self._start = time.monotonic()
+        self._last_seen_count = 0
+        self.rows_written = 0
+        self.polls = 0
+
+    def poll(self, channel, event, telem) -> bool:
+        self.polls += 1
+        if channel is None:
+            return False
+        received = channel.servo_output_messages_received
+        if received == self._last_seen_count or channel.last_servo_output_raw is None:
+            return False
+        self._last_seen_count = received
+        s1, s2, s3, s4 = channel.last_servo_output_raw
+        row = {
+            "wall_time_s": time.monotonic() - self._start,
+            "sitl_time_s": telem.timestamp_s if telem is not None else None,
+            "event": event,
+            "servo1_raw": s1, "servo2_raw": s2, "servo3_raw": s3, "servo4_raw": s4,
+            "armed": telem.armed if telem is not None else None,
+            "mode": telem.flight_mode.value if telem is not None and telem.flight_mode is not None else None,
+            "altitude_agl_m": telem.position_m[2] if telem is not None and telem.position_m is not None else None,
+        }
+        self._writer.writerow(row)
+        self.rows_written += 1
+        return True
+
+    def close(self):
+        self._file.close()
+
+
+def _classify_altitude_result(target_altitude_m, measured_peak_altitude_m, hold_altitudes_m, hard_ceiling_m) -> dict:
+    """Explicit, honest altitude-result classification. Never rounds a real
+    overshoot away and never reports a measured peak as matching the target
+    exactly when it did not - e.g. a 2.11m measured peak against a 2.0m
+    target is always reported as a real +0.11m/+5.5% overshoot, never as
+    "on target"/"exact".
+
+    `hard_ceiling_m` is this script's own configured `HARD_MAX_ALTITUDE_M`
+    constant (a defense-in-depth ceiling on the requested `--max-altitude`
+    - see the module docstring), not the live ArduPilot geofence ceiling
+    (`FENCE_ALT_MAX`), which is reported separately under
+    `report["geofence_gate"]`. Setting a target at or near this hard
+    ceiling makes a ceiling-exceeding overshoot from ordinary real-physics
+    control-loop behavior likely, not itself a malfunction - the `reason`
+    string says so explicitly rather than leaving the flag unexplained."""
+    overshoot_m = measured_peak_altitude_m - target_altitude_m
+    overshoot_pct = (overshoot_m / target_altitude_m * 100.0) if target_altitude_m else None
+    pct_text = f"{overshoot_pct:+.1f}%" if overshoot_pct is not None else "n/a"
+    hold_samples = [v for v in hold_altitudes_m if v is not None]
+    hold_band_m = {
+        "min_m": min(hold_samples) if hold_samples else None,
+        "max_m": max(hold_samples) if hold_samples else None,
+        "sample_count": len(hold_samples),
+    }
+    within_hard_ceiling = measured_peak_altitude_m <= hard_ceiling_m
+    tolerance_m = max(0.15, 0.10 * target_altitude_m) if target_altitude_m else 0.15
+
+    if overshoot_m > tolerance_m:
+        band_classification = "overshoot_exceeds_tolerance"
+    elif overshoot_m < -tolerance_m:
+        band_classification = "undershoot_exceeds_tolerance"
+    else:
+        band_classification = "within_tolerance"
+
+    if not within_hard_ceiling:
+        pass_fail = "fail"
+        reason = (
+            f"measured peak {measured_peak_altitude_m:.3f}m exceeded this script's own hard safety "
+            f"ceiling of {hard_ceiling_m:.3f}m by {measured_peak_altitude_m - hard_ceiling_m:.3f}m. "
+            f"The target ({target_altitude_m:.3f}m) was set at or near that ceiling, so ordinary "
+            "real-physics control-loop overshoot pushes the achieved altitude above it - not "
+            "necessarily a malfunction, but reported as a failed altitude-ceiling check, not a pass. "
+            "Leave margin between --max-altitude and the hard cap on future runs to avoid this."
+        )
+    elif band_classification == "overshoot_exceeds_tolerance":
+        pass_fail = "fail"
+        reason = (
+            f"measured peak {measured_peak_altitude_m:.3f}m overshot the {target_altitude_m:.3f}m "
+            f"target by {overshoot_m:.3f}m ({pct_text}), beyond the {tolerance_m:.3f}m "
+            "tolerance band, though within the hard safety ceiling."
+        )
+    elif band_classification == "undershoot_exceeds_tolerance":
+        pass_fail = "fail"
+        reason = (
+            f"measured peak {measured_peak_altitude_m:.3f}m undershot the {target_altitude_m:.3f}m "
+            f"target by {abs(overshoot_m):.3f}m, beyond the {tolerance_m:.3f}m tolerance band - the "
+            "vehicle may not have climbed to a meaningful altitude."
+        )
+    else:
+        pass_fail = "pass"
+        reason = (
+            f"measured peak {measured_peak_altitude_m:.3f}m is within the {tolerance_m:.3f}m tolerance "
+            f"of the {target_altitude_m:.3f}m target ({overshoot_m:+.3f}m, {pct_text}) and within the "
+            f"{hard_ceiling_m:.3f}m hard safety ceiling."
+        )
+
+    return {
+        "target_altitude_m": target_altitude_m,
+        "measured_peak_altitude_m": measured_peak_altitude_m,
+        "overshoot_m": overshoot_m,
+        "overshoot_pct": overshoot_pct,
+        "hold_band_m": hold_band_m,
+        "hard_safety_ceiling_m": hard_ceiling_m,
+        "within_hard_ceiling": within_hard_ceiling,
+        "tolerance_m": tolerance_m,
+        "classification": band_classification,
+        "pass_fail": pass_fail,
+        "reason": reason,
+    }
 
 
 def run_webots_flight_test(args) -> dict:
@@ -414,6 +565,7 @@ def run_webots_flight_test(args) -> dict:
                                 "is exposed over this connection",
         "realtime_factor": None,  # not obtainable via MAVLink - see Webots' own GUI timeline (operator-verified)
         "csv_path": CSV_PATH,
+        "actuator_csv_path": ACTUATOR_CSV_PATH, "actuator_evidence": None, "altitude_result": None,
         "shutdown": {"clean": False}, "remaining_failures": [], "flight_actually_happened": False,
     }
 
@@ -452,6 +604,11 @@ def run_webots_flight_test(args) -> dict:
 
     armed_this_session = [False]
     logger = _CsvLogger(CSV_PATH)
+    actuator_logger = _ActuatorLogger(ACTUATOR_CSV_PATH)
+
+    def log_tick(event, telem):
+        logger.log(event, telem, channel)
+        actuator_logger.poll(channel, event, telem)
 
     def emergency_cleanup(reason):
         report["emergency_action"] = reason
@@ -461,7 +618,7 @@ def run_webots_flight_test(args) -> dict:
                                              mavutil.mavlink.MAV_CMD_NAV_LAND, 5.0)
             time.sleep(1.0)
             telem_now = transport.receive_telemetry(vehicle_id)
-            logger.log(conn, "emergency_land", telem_now)
+            log_tick("emergency_land", telem_now)
             if telem_now.armed:
                 _send_command_long_and_wait_ack(conn, args.system_id, args.component_id,
                                                  mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 5.0, p1=0)
@@ -493,7 +650,7 @@ def run_webots_flight_test(args) -> dict:
             time.sleep(0.2)
         report["telemetry_valid"] = telem is not None and telem.position_m is not None
         report["estimator_valid"] = bool(telem is not None and telem.estimator_valid)
-        logger.log(conn, "initial_telemetry", telem)
+        log_tick("initial_telemetry", telem)
         if not report["telemetry_valid"] or not report["estimator_valid"]:
             report["remaining_failures"].append("telemetry or estimator not valid - stopping without arming")
             return report
@@ -569,7 +726,7 @@ def run_webots_flight_test(args) -> dict:
                 break
             time.sleep(0.1)
         report["arm"]["confirmed_by_heartbeat"] = confirmed_armed
-        logger.log(conn, "arm_confirmed_check", telem)
+        log_tick("arm_confirmed_check", telem)
         if not confirmed_armed:
             report["remaining_failures"].append("arm command accepted but heartbeat never confirmed armed state")
             emergency_cleanup("arm not confirmed by heartbeat")
@@ -593,7 +750,7 @@ def run_webots_flight_test(args) -> dict:
         climb_deadline = time.monotonic() + _TAKEOFF_CLIMB_TIMEOUT_S
         while time.monotonic() < climb_deadline:
             telem = transport.receive_telemetry(vehicle_id)
-            logger.log(conn, "climbing", telem)
+            log_tick("climbing", telem)
             if telem.position_m is not None and telem.position_m[2] >= args.max_altitude * 0.8:
                 break
             time.sleep(0.2)
@@ -613,7 +770,7 @@ def run_webots_flight_test(args) -> dict:
         sample_count = 0
         while time.monotonic() < hold_deadline:
             telem = transport.receive_telemetry(vehicle_id)
-            logger.log(conn, "hold", telem)
+            log_tick("hold", telem)
             sample_count += 1
             time.sleep(1.0)
         report["hold"] = {"duration_s": args.duration, "sample_count": sample_count}
@@ -636,7 +793,7 @@ def run_webots_flight_test(args) -> dict:
         touchdown_time_s = None
         while time.monotonic() < disarm_deadline:
             telem = transport.receive_telemetry(vehicle_id)
-            logger.log(conn, "landing", telem)
+            log_tick("landing", telem)
             if telem.position_m is not None and touchdown_time_s is None and telem.position_m[2] <= 0.15:
                 touchdown_time_s = time.monotonic()
             if not telem.armed:
@@ -654,7 +811,7 @@ def run_webots_flight_test(args) -> dict:
         report["disarm_confirmed"] = disarmed
         report["touchdown_time_s"] = touchdown_time_s
         report["disarm_time_s"] = time.monotonic() if disarmed else None
-        logger.log(conn, "disarm_confirmed" if disarmed else "disarm_not_confirmed", telem)
+        log_tick("disarm_confirmed" if disarmed else "disarm_not_confirmed", telem)
         armed_this_session[0] = not disarmed
         if not disarmed:
             report["remaining_failures"].append("vehicle did not disarm after landing - reporting honestly")
@@ -664,7 +821,33 @@ def run_webots_flight_test(args) -> dict:
         # 80%-of-target climb-confirmation threshold.
         report["takeoff"]["max_altitude_observed_m"] = logger.max_altitude_agl_m
     finally:
+        # Always computed here, regardless of which return path was taken
+        # above (including an early gate/telemetry/arm failure) - honest
+        # actuator/altitude reporting should not depend on how far the
+        # flight sequence got.
+        report["actuator_evidence"] = {
+            "messages_received": channel.servo_output_messages_received,
+            "rows_written": actuator_logger.rows_written,
+            "ticks_polled": actuator_logger.polls,
+            "last_values": (
+                None if channel.last_servo_output_raw is None else
+                dict(zip(("servo1_raw", "servo2_raw", "servo3_raw", "servo4_raw"), channel.last_servo_output_raw))
+            ),
+            "log_path": ACTUATOR_CSV_PATH,
+            "note": (
+                "no SERVO_OUTPUT_RAW messages were received this run - motor/actuator evidence for "
+                "this run is limited to the altitude profile, reported honestly, not fabricated"
+                if channel.servo_output_messages_received == 0 else
+                f"{channel.servo_output_messages_received} SERVO_OUTPUT_RAW message(s) received and "
+                f"{actuator_logger.rows_written} row(s) logged to {ACTUATOR_CSV_PATH}"
+            ),
+        }
+        report["altitude_result"] = _classify_altitude_result(
+            target_altitude_m=args.max_altitude, measured_peak_altitude_m=logger.max_altitude_agl_m,
+            hold_altitudes_m=logger.hold_altitudes_m, hard_ceiling_m=HARD_MAX_ALTITUDE_M,
+        )
         logger.close()
+        actuator_logger.close()
         stop_result = transport.stop()
         report["shutdown"]["clean"] = stop_result.success
 

@@ -442,6 +442,9 @@ class _VehicleMavlinkChannel:
     armed: bool = False
     mode: AutopilotMode = AutopilotMode.UNKNOWN
     telemetry_sequence: int = 0
+    last_servo_output_raw: Optional[Tuple[int, int, int, int]] = None
+    last_servo_output_time_usec: Optional[int] = None
+    servo_output_messages_received: int = 0
     active_failures: set = dataclasses.field(default_factory=set)
     command_history: List[Tuple[SITLCommand, CommandAck]] = dataclasses.field(default_factory=list)
     ack_history: List[CommandAck] = dataclasses.field(default_factory=list)
@@ -767,6 +770,20 @@ class ArduPilotSITLTransport:
                 channel.estimator_valid = bool(
                     msg.flags & (mavutil.mavlink.EKF_POS_HORIZ_ABS | mavutil.mavlink.EKF_VELOCITY_HORIZ)
                 )
+            elif msg_type == "SERVO_OUTPUT_RAW":
+                # Cached here - the only place this connection's socket is
+                # ever read - rather than via a second, competing
+                # recv_match() call elsewhere: a second reader racing this
+                # loop would either miss messages this loop already
+                # consumed, or itself consume a HEARTBEAT/ATTITUDE/etc.
+                # message meant for the branches above. See
+                # docs/PHASE13_WEBOTS_FLIGHT_TEST.md's "Actuator-output
+                # logging" section for the reliability bug this fixes.
+                channel.last_servo_output_raw = (
+                    int(msg.servo1_raw), int(msg.servo2_raw), int(msg.servo3_raw), int(msg.servo4_raw),
+                )
+                channel.last_servo_output_time_usec = int(msg.time_usec)
+                channel.servo_output_messages_received += 1
 
         # Heartbeat timeout: if we haven't seen ANY heartbeat recently
         # (real wall-clock bound - see module docstring's clock-model note).

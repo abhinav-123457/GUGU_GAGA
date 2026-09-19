@@ -262,3 +262,73 @@ def test_reuses_phase10_and_phase12_helpers_instead_of_duplicating():
     source = pathlib.Path(phase13.__file__).read_text()
     assert "from run_phase10_sitl_flight_test import" in source
     assert "from run_phase12_webots_smoke_test import" in source
+
+
+# --- reliable actuator-output (SERVO_OUTPUT_RAW) logging ---------------------
+
+def test_no_competing_recv_match_for_servo_output_raw():
+    """The original bug: this script used to make its own
+    `recv_match(type="SERVO_OUTPUT_RAW", ...)` call racing against
+    ArduPilotSITLTransport's own socket-draining loop, which silently
+    discarded almost every SERVO_OUTPUT_RAW message before this script's
+    own call could ever see one. The fix moved the capture into the
+    transport's own single reader (`_poll_incoming`) - this script must
+    never reintroduce a second, competing reader of the same socket."""
+    source = pathlib.Path(phase13.__file__).read_text()
+    assert 'recv_match(type="SERVO_OUTPUT_RAW"' not in source
+    assert "recv_match(type='SERVO_OUTPUT_RAW'" not in source
+
+
+def test_actuator_logger_poll_never_sleeps_or_blocks():
+    """`_ActuatorLogger.poll` must be a pure, immediate state check - never
+    a wait for a message that may not arrive (see
+    docs/PHASE13_WEBOTS_FLIGHT_TEST.md's "Actuator-output logging"
+    section)."""
+    source = pathlib.Path(phase13.__file__).read_text()
+    poll_fn = next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.FunctionDef) and n.name == "poll"
+    )
+    poll_source = ast.get_source_segment(source, poll_fn)
+    assert "time.sleep" not in poll_source
+    assert "recv_match" not in poll_source
+    assert "recv_msg" not in poll_source
+
+
+def test_actuator_logger_never_calls_recv_match_or_recv_msg():
+    """`_ActuatorLogger` as a whole must never touch the socket itself -
+    it only ever reads already-cached `channel` attributes."""
+    source = pathlib.Path(phase13.__file__).read_text()
+    class_node = next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.ClassDef) and n.name == "_ActuatorLogger"
+    )
+    class_source = ast.get_source_segment(source, class_node)
+    assert "recv_match" not in class_source
+    assert "recv_msg" not in class_source
+
+
+def test_classify_altitude_result_never_rounds_or_hides_overshoot():
+    """AST-level guarantee that the classification function actually
+    computes a real difference (measured minus target) rather than always
+    reporting zero/exact - complements the functional test with the real
+    2.0/2.11 numbers in tests/test_phase13_webots_flight_test.py."""
+    source = pathlib.Path(phase13.__file__).read_text()
+    fn = _fn("_classify_altitude_result")
+    fn_source = ast.get_source_segment(source, fn)
+    assert "measured_peak_altitude_m - target_altitude_m" in fn_source
+    assert '"overshoot_m"' in fn_source
+    assert '"pass_fail"' in fn_source
+    assert '"reason"' in fn_source
+
+
+def test_run_webots_flight_test_reports_actuator_and_altitude_fields_unconditionally():
+    """Both new report fields are computed in the `finally` block so they
+    are populated regardless of which return path the flight sequence
+    took - see the comment above their computation in
+    run_webots_flight_test."""
+    source = pathlib.Path(phase13.__file__).read_text()
+    flight_fn = _fn("run_webots_flight_test")
+    flight_source = ast.get_source_segment(source, flight_fn)
+    assert 'report["actuator_evidence"] = {' in flight_source
+    assert "report[\"altitude_result\"] = _classify_altitude_result(" in flight_source

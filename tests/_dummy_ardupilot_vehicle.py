@@ -24,7 +24,8 @@ class DummyArduPilotVehicle:
     def __init__(self, port: int, system_id: int = 1, component_id: int = 1,
                  send_heartbeat: bool = True, send_telemetry: bool = True, send_attitude: bool = True,
                  ack_commands: bool = True, initial_position=(0.0, 0.0, 0.0),
-                 battery_remaining: int = 100, estimator_healthy: bool = True):
+                 battery_remaining: int = 100, estimator_healthy: bool = True,
+                 send_servo_output: bool = False):
         self.port = port
         self.system_id = system_id
         self.component_id = component_id
@@ -38,6 +39,13 @@ class DummyArduPilotVehicle:
         self.estimator_healthy = estimator_healthy
         self.armed = False
         self.custom_mode = 0   # STABILIZE
+        # Opt-in only (default False) - existing tests that never pass this
+        # flag see byte-for-byte identical telemetry to before this was
+        # added. Values are a plain list a test can mutate directly
+        # (e.g. `vehicle.servo_outputs[0] = 1500`) to simulate a change in
+        # commanded motor output.
+        self.send_servo_output = send_servo_output
+        self.servo_outputs = [1000, 1000, 1000, 1000]
 
         self._conn = mavutil.mavlink_connection(f"tcpin:127.0.0.1:{port}",
                                                   source_system=system_id, source_component=component_id)
@@ -93,6 +101,12 @@ class DummyArduPilotVehicle:
         )
         flags = (mavutil.mavlink.EKF_POS_HORIZ_ABS | mavutil.mavlink.EKF_VELOCITY_HORIZ) if self.estimator_healthy else 0
         self._conn.mav.ekf_status_report_send(flags, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        if self.send_servo_output:
+            self._conn.mav.servo_output_raw_send(
+                0, 0,
+                self.servo_outputs[0], self.servo_outputs[1], self.servo_outputs[2], self.servo_outputs[3],
+                0, 0, 0, 0,
+            )
 
     def _handle_message(self, msg) -> None:
         msg_type = msg.get_type()
