@@ -150,16 +150,61 @@ identifiers; Phase 10/11/12 and `FakeSITLTransport` remain unaffected.
   Windows, where Webots correctly reports not-installed, and under WSL2
   against the real installed Webots + official example files, where
   every gate passes except the two flags withheld on purpose).
-- **Whether the vehicle actually rose in Webots**: **not yet attempted -
-  no live arm/takeoff/land test has been run this phase**, per the
-  instruction to complete and review implementation/offline tests first.
-- **Maximum measured altitude / held / landed / disarmed / motor
-  evidence / contact result / realtime factor**: all **not yet
-  measured** - live run pending a separate, explicit go-ahead.
-- **Remaining limitations**: the live flight test itself; exact
-  per-motor PWM decode is best-effort (`SERVO_OUTPUT_RAW`, honestly
-  reported if absent); collision/contact and Webots-side realtime factor
-  are not obtainable via MAVLink and are reported as such, not
-  fabricated.
+- **Whether the vehicle actually rose in Webots**: **Yes - confirmed
+  live**, operator-run in WSL2 against the real installed Webots R2025a
+  and the official `iris.wbt`/`ardupilot_vehicle_controller.py`, direct
+  `arducopter --model webots-python -I0` (not `sim_vehicle.py`, per the
+  design above), this script as SITL's sole MAVLink client on
+  `tcp:127.0.0.1:5760`. Geofence was enabled via
+  `docs/phase10_sitl_geofence.parm` appended to `--defaults` (reused
+  unmodified from Phase 10 - `FENCE_ENABLE=1`, `FENCE_TYPE=7`,
+  `FENCE_ALT_MAX=10`, `FENCE_RADIUS=10`, `FENCE_MARGIN=2`), since
+  `FENCE_ENABLE` defaults to `0` and this phase's own gate refuses to
+  arm while it is disabled.
+- **Maximum measured altitude**: **2.11 m** (target `2.0` m, within the
+  `2.0` m hard cap - the operator raised the default `1.0` m target for
+  this run), from `results/phase13_webots_flight_test/flight_log.csv`'s
+  real per-tick `altitude_agl_m` column during the `hold` phase - a
+  real PID overshoot-then-settle profile (climbed to `2.11` m, settled
+  to `~2.04` m for the remainder of the hold), not a step function.
+  **Bug found and fixed this run**: `report["takeoff"]["max_altitude_observed_m"]`
+  was being set once, right after the climb-confirmation threshold
+  (`80%` of target) was crossed, so it under-reported `1.6` m and never
+  reflected the higher altitude actually reached later during `hold`.
+  Fixed by refreshing it from `logger.max_altitude_agl_m` (the CSV
+  logger's own running session-wide max) after the full sequence
+  completes, not at climb-confirmation time - see the comment above the
+  fix in `run_webots_flight_test`. All 54 Phase 13 tests plus the full
+  suite still pass after the fix (see below).
+- **Held**: Yes - 10 samples over the requested `10.0` s hold duration,
+  altitude stable in the `2.0-2.11` m band the whole time (no drift:
+  `east_m`/`north_m` stayed within centimeters of `0.0`).
+- **Landed**: Yes - `LAND` accepted, real monotonic descent from `2.11`
+  m to `0.05` m (the same height as the initial pre-arm resting pose)
+  visible tick-by-tick in the CSV, `touchdown_time_s` recorded.
+- **Disarmed**: Yes - `disarm_confirmed: true`, automatically after
+  touchdown (no forced/explicit disarm command was needed).
+- **Motor/actuator evidence**: real physics-driven flight occurred
+  (climb/hold/descent profile above is not obtainable without real
+  motor thrust in Webots), but this specific run's `SERVO_OUTPUT_RAW`
+  columns in the CSV are empty - the non-blocking per-tick check in
+  `_CsvLogger.log()` did not happen to catch a `SERVO_OUTPUT_RAW`
+  message on this run. Reported honestly as a gap, not fabricated;
+  the altitude profile itself is the motor-effect evidence available
+  from this run.
+- **Contact/collision result**: not directly observable via MAVLink,
+  as documented above; the smooth, uninterrupted altitude profile and
+  continuous `estimator_valid` are the best available indirect evidence
+  of no abnormal contact.
+- **Realtime factor**: not obtainable via MAVLink from this script, as
+  documented above (`report["realtime_factor"]` is `None`).
+- **Remaining limitations**: per-motor PWM decode remains best-effort
+  and was not captured this run (see above); collision/contact and
+  Webots-side realtime factor remain unavailable via MAVLink by design.
 
-**No arm/takeoff/land command has been sent in this phase.**
+**Live arm/takeoff/land commands were sent in this phase, with explicit
+operator confirmation, after the implementation and all offline tests
+were complete and reviewed** - see `results/phase13_webots_flight_test/flight_log.csv`
+and `results/phase13_webots_flight_test/phase13_webots_flight_test_result.json`
+(both gitignored - real run artifacts, not committed) for the full
+per-tick record.

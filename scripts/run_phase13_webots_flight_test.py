@@ -658,6 +658,11 @@ def run_webots_flight_test(args) -> dict:
         armed_this_session[0] = not disarmed
         if not disarmed:
             report["remaining_failures"].append("vehicle did not disarm after landing - reporting honestly")
+        # Refresh with the true session peak (climb + hold + landing), not just the
+        # value observed at the climb-confirmation instant set earlier - the hold
+        # phase can (and, under real physics, does) reach a higher altitude than the
+        # 80%-of-target climb-confirmation threshold.
+        report["takeoff"]["max_altitude_observed_m"] = logger.max_altitude_agl_m
     finally:
         logger.close()
         stop_result = transport.stop()
