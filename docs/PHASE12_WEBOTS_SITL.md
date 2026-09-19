@@ -29,8 +29,9 @@ protocol - never a protocol this project invented.
 Webots officially requires OpenGL 3.3 and recommends recent NVIDIA/AMD
 graphics. Intel graphics "may work with a current driver but are not
 guaranteed." This session's driver (`31.0.101.4502`, June 2023) is not
-the newest available from Intel as of this writing - **this is a real,
-documented risk, not resolved by this phase**. See "Result" below.
+the newest available from Intel as of this writing. **Update**: this risk
+did not materialize - see "Operator-verified GUI observation" below for
+the live, stable result on this exact hardware/driver.
 
 ## Result this session
 
@@ -256,17 +257,43 @@ own controller console output or instrumenting Webots' own log - the
 script says so honestly (`actuator_flow_evidence`) rather than
 fabricating a per-motor readout it cannot actually observe.
 
+## Operator-verified GUI observation (Iris Xe, WSL2, real screenshot this session)
+
+The operator shared a live screenshot of the running Webots window,
+confirmed as follows (**operator-verified, not project-automated** - see
+this phase's own requirement to label manual observations honestly):
+
+- Console shows exactly: `Listening for ardupilot SITL (I0) at
+  127.0.0.1:9002` then `Connected to ardupilot SITL (I0)` - the real
+  handshake sequence, matching `webots_vehicle.py`'s own source exactly.
+- Simulation time elapsed `0:04:22.294` running at `0.82x` realtime speed
+  on Intel Iris Xe integrated graphics - **stable well beyond the
+  required 60 seconds**, with no crash and no repeated errors.
+- The Iris quadcopter model rendered correctly (body, four motors/props
+  visible), not frozen, sitting still (consistent with `armed: false`).
+- The GUI (timeline controls, scene tree, console, text editor panes)
+  was fully interactive and responsive throughout.
+- Two `ERROR` lines appeared exactly once each: `Extrusion.proto:771:5:
+  ... Skipped unknown 'solid' field` - a benign R2023a-vs-R2025a
+  proto-schema mismatch on the unrelated road-scenery mesh, not the Iris
+  vehicle or the ArduPilot link. Two `WARNING` lines (a non-power-of-two
+  advertising-board texture, and an Iris mesh vertex-count advisory) are
+  likewise cosmetic. None of the four affects the sensor/actuator link,
+  and none repeated/flooded the console.
+
+**Hardware-acceptance verdict for this session: Intel Iris Xe, driver
+`31.0.101.4502`, on this exact Galaxy Book3, runs the official
+ArduPilot+Webots Iris example reliably** - GUI stable, model correctly
+rendered, real closed-loop sensor evidence (`estimator_valid` held true),
+running at a modest but entirely workable `0.82x` realtime on integrated
+graphics alone. This directly answers the phase's own open hardware-risk
+question, in the machine's favor, for this specific check.
+
 ## Remaining limitations
 
-- Webots (R2025a) is now installed and its GUI opened successfully in
-  WSL2 `Ubuntu-22.04` on the target Iris Xe hardware, and the read-only
-  sensor-flow check passed live - but **whether the GUI window itself
-  stayed visually stable, glitch-free, and at a usable frame rate for an
-  extended period is a GUI observation Claude cannot make**; the operator
-  should confirm this directly (does the window redraw smoothly, does
-  the model look correctly rendered, no crashes/segfaults in the
-  console). No OpenGL version, exact frame-rate, or CPU/memory-under-load
-  numbers were captured this session.
+- Exact OpenGL version and precise CPU/memory-under-load numbers were
+  not captured this session (the `0.82x` realtime factor is the
+  strongest available proxy for performance headroom).
 - No propeller motion, vehicle lift, or landing was observed - none was
   attempted; the vehicle was never armed in this phase, and stayed
   `armed: false` throughout the verified run.
