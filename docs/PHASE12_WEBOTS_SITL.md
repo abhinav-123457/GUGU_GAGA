@@ -60,10 +60,64 @@ test, requiring the operator to start Webots+SITL manually first) has
 not yet been performed - see the next steps in this document's own
 usage section above.
 
-**This phase stops here for live verification.** Installing Webots (a
-large third-party GUI application) is the operator's call, not something
-done automatically. Once installed, `--dry-run` (below) will confirm it
-and `--run` will attempt the real sensor/actuator checks.
+**Update: `--run` was performed live, against the real official example,
+and succeeded.** The operator started SITL and Webots manually per the
+official commands below:
+
+```bash
+cd /home/swarmbuild/ardupilot
+Tools/autotest/sim_vehicle.py -v ArduCopter -w --model webots-python \
+    --add-param-file=libraries/SITL/examples/Webots_Python/params/iris.parm
+# separately:
+webots libraries/SITL/examples/Webots_Python/worlds/iris.wbt
+```
+
+Webots' own console printed `Connected to ardupilot SITL (I0)` - the
+exact documented handshake string, read directly from
+`webots_vehicle.py::_handle_sitl` (see "Official example" below).
+
+**Real finding, worth recording**: `sim_vehicle.py`'s primary MAVLink port
+(`tcp:127.0.0.1:5760`) only actively serves its *first* connected client
+(MAVProxy, which `sim_vehicle.py` launches automatically) - a second raw
+TCP client completes the handshake but never receives a byte (confirmed
+by a raw-socket read returning 0 bytes in 15s, while `/proc/<mavproxy_pid>/io`
+showed MAVProxy's own `rchar` climbing continuously, proving SITL's loop
+was running normally the whole time). This is standard ArduPilot/MAVProxy
+practice, not a bug: additional consumers attach through a MAVProxy
+output, added live via its own console with `output add
+127.0.0.1:14551`, then pointing this script's `--connection` at
+`udpin:127.0.0.1:14551` instead of the primary port.
+
+With that connection, `--run --duration 15` returned:
+
+```json
+{
+  "attach": {"succeeded": true, "reason": null},
+  "heartbeat": {"received": true},
+  "sensor_flow_evidence": "estimator_valid held true across the observation window",
+  "armed": false, "estimator_valid": true,
+  "telemetry_sample_count": 149,
+  "controller_port_bound": true,
+  "shutdown": {"clean": true},
+  "remaining_failures": [],
+  "ok": true
+}
+```
+
+**This is genuine closed-loop evidence, not a pose-only render like Phase
+11.** `estimator_valid` staying `true` for the full window means
+ArduPilot's EKF was continuously consuming real IMU/GPS data that only
+exists because Webots was computing real physics and sensor output every
+tick - a static/frozen renderer could not produce this result. The
+vehicle remained disarmed throughout (`armed: false`); no flight command
+was sent. **The 2023a-vs-2025a version-compatibility risk flagged above
+did not materialize for sensor flow** - R2025a interoperated correctly
+with the official controller for this check. Actuator-direction PWM
+values were not independently decoded by this script (honestly reported
+as `actuator_flow_evidence`); whether the Webots window itself rendered
+the model stably and without visual glitches for the full window is a
+GUI observation this script cannot make - see the operator-verification
+note in "Remaining limitations" below.
 
 ## Official example (verified against this session's real ArduPilot checkout)
 
@@ -204,17 +258,27 @@ fabricating a per-motor readout it cannot actually observe.
 
 ## Remaining limitations
 
-- Webots itself was not installed this session on this exact hardware -
-  the central hardware-acceptance question (does Iris Xe run Webots
-  reliably) is **unanswered**, not answered favorably.
-- No OpenGL version, frame-rate, CPU/memory-under-load, or rendering-
-  stability data exists yet for this machine.
+- Webots (R2025a) is now installed and its GUI opened successfully in
+  WSL2 `Ubuntu-22.04` on the target Iris Xe hardware, and the read-only
+  sensor-flow check passed live - but **whether the GUI window itself
+  stayed visually stable, glitch-free, and at a usable frame rate for an
+  extended period is a GUI observation Claude cannot make**; the operator
+  should confirm this directly (does the window redraw smoothly, does
+  the model look correctly rendered, no crashes/segfaults in the
+  console). No OpenGL version, exact frame-rate, or CPU/memory-under-load
+  numbers were captured this session.
 - No propeller motion, vehicle lift, or landing was observed - none was
-  attempted; the vehicle was never armed in this phase.
-- The Arrangement B networking path is documented and safety-checked but
-  not live-exercised, since there was nothing running to connect to.
-- `--run`'s actuator-flow check is evidence, not a full per-channel PWM
-  decode - documented above as an honest scope limit, not a gap to paper
-  over.
+  attempted; the vehicle was never armed in this phase, and stayed
+  `armed: false` throughout the verified run.
+- The Arrangement B (Windows Webots + WSL2 SITL) networking path is
+  documented and safety-checked but not live-exercised - this session
+  used Arrangement A (everything in WSL2) throughout.
+- `--run`'s actuator-flow check is evidence (EKF validity + controller
+  UDP port bound), not a full per-channel PWM decode - documented above
+  as an honest scope limit, not a gap to paper over.
+- The `output add 127.0.0.1:14551` step is a manual, operator-run
+  MAVProxy console command - it is not automated by this project's
+  script (which never spawns or controls MAVProxy), and must be repeated
+  each time SITL/MAVProxy is restarted.
 
 **No arm/takeoff/land command was sent in this phase.**
