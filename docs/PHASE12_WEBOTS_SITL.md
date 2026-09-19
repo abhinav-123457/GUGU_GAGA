@@ -32,24 +32,33 @@ guaranteed." This session's driver (`31.0.101.4502`, June 2023) is not
 the newest available from Intel as of this writing - **this is a real,
 documented risk, not resolved by this phase**. See "Result" below.
 
-## Result this session: **Webots is not installed, on either Windows or WSL2**
+## Result this session
 
-Checked live, not assumed:
+**Initially: Webots was not installed anywhere** (checked live on both
+Windows and WSL2 `Ubuntu-22.04` - no `webots` on `PATH`, no standard
+install directory, no matching `dpkg` package). This was reported
+honestly as "Webots not installed / not live verified" - not claimed as
+success - and Phase 11's FlightGear was not silently substituted for it
+(`scripts/run_phase12_webots_smoke_test.py` never imports
+`telemetry_mapping` or `FlightGearBridge` - see
+`tests/test_phase12_webots_architecture.py::test_no_flightgear_or_pybullet_fallback`).
 
-- Windows: no `webots` on `PATH`; `C:\Program Files\Webots`,
-  `C:\Program Files (x86)\Webots`, and the per-user Programs folder do
-  not exist.
-- WSL2 `Ubuntu-22.04`: no `webots` on `PATH`; no matching `dpkg` package.
+**Update: the operator installed Webots in WSL2 `Ubuntu-22.04`**, via the
+apt package `webots` **version `2025a`** (binary `/usr/local/bin/webots`,
+confirmed live via `dpkg -l` and `webots --version`). Re-running
+`--dry-run --ardupilot-root /home/swarmbuild/ardupilot` now returns
+`"webots_installation": {"found": true, ...}`, all three official files
+found, `"ok": true`.
 
-**Therefore: no OpenGL version, no Webots version, no rendering
-stability, no motor/propeller/physics observation, and no sensor/
-actuator closed-loop evidence could be live-verified this session.**
-Per this phase's own requirement, this is reported honestly as "Webots
-not installed / not live verified" - not claimed as success, and Phase
-11's FlightGear is not silently substituted for it (`scripts/
-run_phase12_webots_smoke_test.py` never imports `telemetry_mapping` or
-`FlightGearBridge` - see `tests/test_phase12_webots_architecture.py::
-test_no_flightgear_or_pybullet_fallback`).
+**Version compatibility caveat, not yet resolved**: ArduPilot's own docs
+state the Webots-Python controller "was built for Webots 2023a and is
+not backward compatible. Newer versions should also work, however."
+R2025a is two major releases newer than the version this integration was
+built against - this is a real, documented risk this phase has not yet
+tested, not a confirmed pass. `--run` (the actual sensor/actuator smoke
+test, requiring the operator to start Webots+SITL manually first) has
+not yet been performed - see the next steps in this document's own
+usage section above.
 
 **This phase stops here for live verification.** Installing Webots (a
 large third-party GUI application) is the operator's call, not something
