@@ -162,21 +162,51 @@ class SARMissionConfig:
     def build_safety_config(self) -> SafetySupervisorConfig:
         if self.safety_config is not None:
             return self.safety_config
-        return SafetySupervisorConfig(max_speed_mps=self.max_speed_mps, geofence_margin_m=self.geofence_margin_m)
+        # fallback_dt_s (used only for a vehicle's very first evaluate()
+        # call, before any real inter-tick interval is known) defaults to
+        # 1/24s in SafetySupervisorConfig - a frame-rate assumption tuned
+        # for a much faster swarm-sim control loop elsewhere in this
+        # codebase, not this mission's own slower control period. Found
+        # via this phase's own live
+        # testing: with that mismatched default, the very first safety
+        # evaluation after handoff from ArduPilot's own takeoff (while the
+        # vehicle still had real residual climb momentum) computed an
+        # acceleration budget ~24x too small to meaningfully correct that
+        # momentum, letting the vehicle coast well past its intended
+        # altitude before a realistic dt took over on the next tick. Using
+        # this mission's own `dt_s` instead gives that first correction a
+        # realistic budget - see docs/PHASE14_SAR_WEBOTS.md.
+        return SafetySupervisorConfig(max_speed_mps=self.max_speed_mps, geofence_margin_m=self.geofence_margin_m,
+                                       fallback_dt_s=self.dt_s)
 
     def build_geofence(self) -> GeofenceSpec:
         """A geofence that safely encloses BOTH the search area and
-        `home_m`, each with `geofence_margin_m` of buffer - never just the
-        search area alone. `home_m` sitting on or near a search-area edge
-        (e.g. the common case of launching from a corner of the search
-        rectangle) would otherwise place the vehicle right on the fence
-        boundary at takeoff, causing a GEOFENCE_RISK override before the
-        mission ever starts moving (found via this phase's own offline
-        smoke test - see docs/PHASE14_SAR_WEBOTS.md)."""
-        min_x = min(self.search_area.min_x_m, self.home_m[0]) - self.geofence_margin_m
-        max_x = max(self.search_area.max_x_m, self.home_m[0]) + self.geofence_margin_m
-        min_y = min(self.search_area.min_y_m, self.home_m[1]) - self.geofence_margin_m
-        max_y = max(self.search_area.max_y_m, self.home_m[1]) + self.geofence_margin_m
+        `home_m`, each with buffer - never just the search area alone.
+        `home_m` sitting on or near a search-area edge (e.g. the common
+        case of launching from a corner of the search rectangle) would
+        otherwise place the vehicle right on the fence boundary at
+        takeoff, causing a GEOFENCE_RISK override before the mission ever
+        starts moving (found via this phase's own offline smoke test -
+        see docs/PHASE14_SAR_WEBOTS.md).
+
+        The buffer here is `2 * geofence_margin_m`, not `geofence_margin_m`
+        - `SafetySupervisor` itself flags GEOFENCE_RISK whenever the
+        vehicle's horizontal distance to this boundary drops below
+        `geofence_margin_m` (see geofence_horizontal_margin_m() in
+        safety_supervisor.py). A one-margin buffer places `home_m` exactly
+        ON that risk threshold rather than strictly inside it - offline,
+        FakeSITLTransport's noiseless kinematics never crosses that exact
+        boundary, but a real live flight's GPS/accel noise and PID
+        hunting does, almost every tick, permanently overriding the
+        candidate and preventing the mission from ever leaving
+        TAKEOFF_REQUESTED (found via this phase's first live Webots run -
+        see docs/PHASE14_SAR_WEBOTS.md). Doubling the buffer gives `home_m`
+        a full `geofence_margin_m` of real headroom against that noise."""
+        buffer_m = 2.0 * self.geofence_margin_m
+        min_x = min(self.search_area.min_x_m, self.home_m[0]) - buffer_m
+        max_x = max(self.search_area.max_x_m, self.home_m[0]) + buffer_m
+        min_y = min(self.search_area.min_y_m, self.home_m[1]) - buffer_m
+        max_y = max(self.search_area.max_y_m, self.home_m[1]) + buffer_m
         return GeofenceSpec(
             frame=Frame.LOCAL_ENU, center_m=((min_x + max_x) / 2.0, (min_y + max_y) / 2.0),
             half_extents_m=((max_x - min_x) / 2.0, (max_y - min_y) / 2.0),

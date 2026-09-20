@@ -21,7 +21,7 @@ import pytest
 
 from swarm_sim.autopilot.types import AdapterResult, AutopilotMode, ConnectionState, VehicleTelemetry
 from swarm_sim.contracts import DetectionCandidate, Frame, SensorObservation
-from swarm_sim.safety_supervisor import SafetySupervisor, SafetySupervisorConfig
+from swarm_sim.safety_supervisor import SafetySupervisor, SafetySupervisorConfig, geofence_horizontal_margin_m
 from swarm_sim.sar_mission import (
     ALLOWED_TRANSITIONS, MissionState, SARMission, SARMissionConfig, TERMINAL_STATES, run_sar_mission_offline,
 )
@@ -152,6 +152,26 @@ class TestSearchPattern:
         area = RectangularSearchArea(0.0, 0.0, 2.0, 2.0)
         with pytest.raises(ValueError):
             generate_lawnmower_waypoints(area, 1.0, lane_spacing_m=1.0, margin_m=5.0)
+
+    def test_home_sits_with_real_headroom_inside_the_geofence_risk_margin(self):
+        """Regression for the first live Webots run (docs/PHASE14_SAR_WEBOTS.md):
+        home_m must sit MORE than geofence_margin_m from the built fence
+        boundary, not exactly on that threshold - otherwise real telemetry
+        noise flips SafetySupervisor's GEOFENCE_RISK check on almost every
+        tick and the mission never leaves TAKEOFF_REQUESTED, even though
+        offline's noiseless FakeSITLTransport never showed the problem."""
+        config = _config(home_m=(0.0, 0.0, 0.0), geofence_margin_m=1.0)
+        geofence = config.build_geofence()
+        margin_at_home = geofence_horizontal_margin_m(config.home_m, geofence)
+        assert margin_at_home > config.geofence_margin_m
+        assert margin_at_home >= 2 * config.geofence_margin_m - 1e-9
+
+    def test_home_headroom_scales_with_margin_for_a_home_at_search_area_corner(self):
+        area = RectangularSearchArea(0.0, 0.0, 20.0, 14.0)
+        config = _config(search_area=area, home_m=(0.0, 0.0, 0.0), geofence_margin_m=1.5)
+        geofence = config.build_geofence()
+        margin_at_home = geofence_horizontal_margin_m(config.home_m, geofence)
+        assert margin_at_home > config.geofence_margin_m
 
     def test_generation_is_deterministic(self):
         area = RectangularSearchArea(0.0, 0.0, 15.0, 15.0)
@@ -320,6 +340,25 @@ class TestSensorAndDetectionScenarios:
 # ==========================================================================
 
 class TestCommandPath:
+    def test_build_safety_config_uses_mission_dt_as_the_first_tick_fallback(self):
+        """Regression for this phase's third live finding: SafetySupervisorConfig's
+        own fallback_dt_s (1/24s) is tuned for a fast PyBullet-style swarm
+        loop, not this mission's own control period. Left at that default,
+        a vehicle's very first evaluate() call - exactly when it may still
+        carry real residual momentum from a just-completed real takeoff -
+        gets an acceleration budget ~24x too small to correct it, letting
+        real telemetry coast well past the intended altitude before a
+        realistic dt takes over on the next tick. build_safety_config()
+        must use the mission's own dt_s instead."""
+        config = _config(dt_s=1.0)
+        safety_config = config.build_safety_config()
+        assert safety_config.fallback_dt_s == 1.0
+
+    def test_explicit_safety_config_override_is_not_clobbered(self):
+        override = SafetySupervisorConfig(max_speed_mps=0.1, geofence_margin_m=3.0, fallback_dt_s=2.5)
+        config = _config(dt_s=1.0, safety_config=override)
+        assert config.build_safety_config() is override
+
     def test_tick_never_returns_a_command_without_a_safety_decision(self):
         mission = _mission()
         results = _run_ticks(mission, [(0.0, 0.0, 0.5)])

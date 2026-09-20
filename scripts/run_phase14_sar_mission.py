@@ -199,6 +199,40 @@ def _check_sar_live_gate(args) -> dict:
     return {"passed": not reasons_failed, "checks": checks, "reasons_failed": reasons_failed}
 
 
+def _wait_for_stable_prearm_health(conn, sysid: int, compid: int, timeout_s: float,
+                                    required_consecutive: int = 3) -> dict:
+    """Gate arming on ArduPilot's own real-time SYS_STATUS PREARM_CHECK
+    health bit, not just a fixed-window STATUSTEXT scan.
+
+    Found via this phase's first live run: the "PreArm: ..." STATUSTEXT
+    banner is rate-limited and can go quiet for several seconds even while
+    a check is still genuinely flapping - `_collect_statustexts(conn, 6.0)`
+    (Phase 13's own helper, reused above for the human-readable message
+    list) can report a clean window purely by timing luck while the
+    vehicle is not actually stably healthy, so the arm command lands
+    during a still-unhealthy instant and is honestly rejected by
+    ArduPilot (`result=4`) with no accompanying STATUSTEXT at all. The
+    SYS_STATUS health bit updates every message, unrated-limited, so this
+    waits for several consecutive healthy reads before treating the
+    vehicle as actually ready to arm - it never sends the arm command
+    itself, and never overrides a genuine failure."""
+    samples = []
+    consecutive_healthy = 0
+    deadline = time.monotonic() + timeout_s
+    prearm_bit = mavutil.mavlink.MAV_SYS_STATUS_PREARM_CHECK
+    while time.monotonic() < deadline:
+        msg = conn.recv_match(type="SYS_STATUS", blocking=False)
+        if msg is None:
+            time.sleep(0.05)
+            continue
+        healthy = bool(msg.onboard_control_sensors_health & prearm_bit)
+        samples.append({"monotonic_s": time.monotonic(), "healthy": healthy})
+        consecutive_healthy = consecutive_healthy + 1 if healthy else 0
+        if consecutive_healthy >= required_consecutive:
+            return {"stable_healthy": True, "samples": samples}
+    return {"stable_healthy": False, "samples": samples}
+
+
 def _operator_confirmed(args) -> bool:
     if args.confirm_webots_flight_test:
         return True
@@ -238,11 +272,13 @@ def run_live_sar_mission(args) -> dict:
         "attach": {"succeeded": False, "reason": None}, "heartbeat": {"received": False},
         "estimator_valid": None, "telemetry_valid": None, "initially_disarmed": None,
         "prearm_clear": None, "prearm_messages": [], "battery_state": {}, "geofence_enabled": None,
+        "prearm_health_check": None,
         "version": {"confirmed": False, "raw": None}, "events": [],
-        "arm": {"attempted": False, "accepted": None, "confirmed_by_heartbeat": None},
-        "takeoff": {"attempted": False, "accepted": None, "max_altitude_observed_m": None},
+        "arm": {"attempted": False, "accepted": None, "confirmed_by_heartbeat": None, "status_texts": []},
+        "takeoff": {"attempted": False, "accepted": None, "max_altitude_observed_m": None, "status_texts": []},
         "sar_mission_final_state": None, "sar_summary": None,
-        "land": {"attempted": False, "accepted": None}, "disarm_confirmed": None, "emergency_action": None,
+        "land": {"attempted": False, "accepted": None, "status_texts": []}, "disarm_confirmed": None,
+        "emergency_action": None,
         "actuator_evidence": None, "altitude_result": None, "realtime_factor": None,
         "shutdown": {"clean": False}, "remaining_failures": [], "flight_actually_happened": False,
     }
@@ -281,6 +317,15 @@ def run_live_sar_mission(args) -> dict:
 
     seed_manager = SeedManager(args.seed)
     sar_config = _sar_config_from_args(args)
+    # The live tick loop below actually sleeps _MISSION_TICK_DT_S (1.0s)
+    # between ticks, not SARMissionConfig's own default dt_s (0.5s, tuned
+    # for the offline FakeSITLTransport path's own step() cadence) -
+    # build_safety_config() uses dt_s as SafetySupervisorConfig's
+    # fallback_dt_s (the assumed interval for a vehicle's very first
+    # evaluate() call, before a real inter-tick interval is measured), so
+    # it must match this script's real cadence for that first, momentum-
+    # critical correction to have a realistic acceleration budget.
+    sar_config.dt_s = _MISSION_TICK_DT_S
 
     def emergency_cleanup(reason):
         report["emergency_action"] = reason
@@ -352,21 +397,34 @@ def run_live_sar_mission(args) -> dict:
             report["remaining_failures"].append(f"pre-arm messages present: {report['prearm_messages']}")
             return report
 
+        health_check = _wait_for_stable_prearm_health(conn, args.system_id, args.component_id, timeout_s=20.0)
+        report["prearm_health_check"] = {
+            "stable_healthy": health_check["stable_healthy"], "sample_count": len(health_check["samples"]),
+            "last_samples": health_check["samples"][-5:],
+        }
+        if not health_check["stable_healthy"]:
+            report["remaining_failures"].append(
+                "PreArm health bit never reported stably healthy within 20s - refusing to arm "
+                f"(last samples: {health_check['samples'][-5:]})")
+            return report
+
         # ---- arm + takeoff (Phase 13's own gated mechanism, reused inline) ----
-        mode_ok, _mode_result, _texts = _set_mode_guided(conn, args.system_id, args.component_id, 10.0)
-        log_event("mode_set_guided", accepted=mode_ok)
+        mode_ok, _mode_result, mode_texts = _set_mode_guided(conn, args.system_id, args.component_id, 10.0)
+        log_event("mode_set_guided", accepted=mode_ok, status_texts=mode_texts)
         if not mode_ok:
-            report["remaining_failures"].append("could not set GUIDED mode")
+            report["remaining_failures"].append(f"could not set GUIDED mode - status texts: {mode_texts}")
             return report
 
         report["arm"]["attempted"] = True
-        arm_ok, arm_result, _texts = _send_command_long_and_wait_ack(
+        arm_ok, arm_result, arm_texts = _send_command_long_and_wait_ack(
             conn, args.system_id, args.component_id, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             _ARM_TAKEOFF_LAND_COMMAND_TIMEOUT_S, p1=1, p2=0)
         report["arm"]["accepted"] = arm_ok
-        log_event("arm_attempt", accepted=arm_ok, result=arm_result)
+        report["arm"]["status_texts"] = arm_texts
+        log_event("arm_attempt", accepted=arm_ok, result=arm_result, status_texts=arm_texts)
         if not arm_ok:
-            report["remaining_failures"].append(f"arm rejected by ArduPilot: result={arm_result}")
+            report["remaining_failures"].append(
+                f"arm rejected by ArduPilot: result={arm_result} - status texts: {arm_texts}")
             return report
 
         confirm_deadline = time.monotonic() + _ARM_CONFIRM_TIMEOUT_S
@@ -385,13 +443,15 @@ def run_live_sar_mission(args) -> dict:
         log_event("armed_confirmed")
 
         report["takeoff"]["attempted"] = True
-        takeoff_ok, takeoff_result, _texts = _send_command_long_and_wait_ack(
+        takeoff_ok, takeoff_result, takeoff_texts = _send_command_long_and_wait_ack(
             conn, args.system_id, args.component_id, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
             _ARM_TAKEOFF_LAND_COMMAND_TIMEOUT_S, p7=sar_config.search_altitude_m)
         report["takeoff"]["accepted"] = takeoff_ok
-        log_event("takeoff_attempt", accepted=takeoff_ok, result=takeoff_result)
+        report["takeoff"]["status_texts"] = takeoff_texts
+        log_event("takeoff_attempt", accepted=takeoff_ok, result=takeoff_result, status_texts=takeoff_texts)
         if not takeoff_ok:
-            report["remaining_failures"].append(f"takeoff rejected by ArduPilot: result={takeoff_result}")
+            report["remaining_failures"].append(
+                f"takeoff rejected by ArduPilot: result={takeoff_result} - status texts: {takeoff_texts}")
             emergency_cleanup("takeoff rejected after arming")
             return report
 
@@ -420,14 +480,33 @@ def run_live_sar_mission(args) -> dict:
                                        vehicle_id=sar_config.vehicle_id)
         mission = SARMission(sar_config, world)
         mission.state = MissionState.TAKEOFF_REQUESTED   # arm/takeoff already done for real above
-        mission._mission_start_s = telem.timestamp_s
 
         adapter = build_ardupilot_sitl_adapter(vehicle_id, transport)
         actuator_logger = _ActuatorLogger(os.path.join(OUT_DIR, "live", "actuator_log.csv"))
         mission_start_wall = time.monotonic()
         mission_deadline = mission_start_wall + args.duration + _LAND_DISARM_TIMEOUT_S
+
+        # ArduPilotSITLTransport's own clock is NEVER advanced automatically
+        # (unlike FakeSITLTransport.step(), which calls set_sim_time() for
+        # you) - see the transport's module docstring's "Clock model" note.
+        # Found via this phase's own first live run: without this, every
+        # telemetry sample was timestamped 0.0 forever, so
+        # SafetySupervisor.evaluate()'s own real-dt-based acceleration
+        # limiter (bound_velocity_step) saw dt_s clamped to ~0 every tick
+        # and froze each commanded velocity within a hair of the vehicle's
+        # OWN last real velocity - including its residual post-takeoff
+        # climb rate - instead of correcting it, letting the vehicle coast
+        # far past its intended altitude (measured peak 8.05m against a
+        # 1.0m target and 2.0m hard ceiling) before the ceiling override
+        # could ever gain authority. It also meant the mission's own
+        # `mission_timeout_s` could never fire (elapsed time was always
+        # `0.0 - 0.0`), relying entirely on this script's outer wall-clock
+        # deadline to end the flight. See docs/PHASE14_SAR_WEBOTS.md.
+        transport.set_sim_time(0.0)
+        mission._mission_start_s = 0.0
         try:
             while time.monotonic() < mission_deadline:
+                transport.set_sim_time(time.monotonic() - mission_start_wall)
                 telem = transport.receive_telemetry(vehicle_id)
                 now_s = telem.timestamp_s
                 vehicle_telem = adapter.read_telemetry()
@@ -448,13 +527,15 @@ def run_live_sar_mission(args) -> dict:
 
         # ---- land + disarm (Phase 13's own gated mechanism, reused inline) ----
         report["land"]["attempted"] = True
-        land_ok, land_result, _texts = _send_command_long_and_wait_ack(
+        land_ok, land_result, land_texts = _send_command_long_and_wait_ack(
             conn, args.system_id, args.component_id, mavutil.mavlink.MAV_CMD_NAV_LAND,
             _ARM_TAKEOFF_LAND_COMMAND_TIMEOUT_S)
         report["land"]["accepted"] = land_ok
-        log_event("land_attempt", accepted=land_ok, result=land_result)
+        report["land"]["status_texts"] = land_texts
+        log_event("land_attempt", accepted=land_ok, result=land_result, status_texts=land_texts)
         if not land_ok:
-            report["remaining_failures"].append(f"LAND rejected by ArduPilot: result={land_result}")
+            report["remaining_failures"].append(
+                f"LAND rejected by ArduPilot: result={land_result} - status texts: {land_texts}")
             emergency_cleanup("LAND command rejected")
             return report
 

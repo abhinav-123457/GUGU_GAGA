@@ -145,6 +145,26 @@ def test_live_script_never_sends_a_raw_candidate_to_the_adapter():
     assert "adapter.send_command(tick_result.adapter_command)" in source
 
 
+def test_live_mission_loop_advances_the_transport_clock_every_tick():
+    """Regression for this phase's first live run: ArduPilotSITLTransport
+    never advances its own clock automatically (unlike FakeSITLTransport's
+    step(), which calls set_sim_time() internally) - every telemetry
+    sample came back timestamped 0.0 for the whole flight, which froze
+    SafetySupervisor's real-dt-based acceleration limiter and let the
+    vehicle coast to 8x its target altitude before any correction could
+    take effect. The live tick loop must call transport.set_sim_time(...)
+    itself, every iteration, before reading telemetry."""
+    source = _source(phase14)
+    run_live_fn = next(n for n in ast.walk(_tree(phase14))
+                        if isinstance(n, ast.FunctionDef) and n.name == "run_live_sar_mission")
+    live_source = ast.get_source_segment(source, run_live_fn)
+    assert "transport.set_sim_time(" in live_source
+    set_time_idx = live_source.index("transport.set_sim_time(time.monotonic()")
+    receive_telem_idx = live_source.index("transport.receive_telemetry(vehicle_id)\n                now_s")
+    assert set_time_idx < receive_telem_idx, \
+        "set_sim_time() must be called before receive_telemetry() inside the mission tick loop"
+
+
 # ==========================================================================
 # 3. no six-drone / swarm / consensus / FlightGear / PyBullet
 # ==========================================================================

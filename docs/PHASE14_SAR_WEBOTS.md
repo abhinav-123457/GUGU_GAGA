@@ -291,12 +291,27 @@ bypass `SafetySupervisor`; failure states stop or land safely; logs are
 reproducible (same seed -> same summary); Phase 8-13 regression tests
 pass.
 
-**Live** (not yet attempted - see "Live results" below): one vehicle
-takes off in Webots; the vehicle follows at least one search waypoint;
-telemetry confirms position and altitude; simulated observations are
-generated; the mission returns home; the vehicle lands; disarm is
-confirmed; no collision occurs; actuator exchange is logged when
-available; no safety gate was bypassed.
+**Live** (not yet met - three live attempts so far, each surfacing a
+different real bug, see "Live results" below): one vehicle takes off in
+Webots (met on all three attempts); the vehicle follows at least one
+search waypoint (**not met** - attempt 1 stuck in `TAKEOFF_REQUESTED` on
+a geofence-margin bug, now fixed offline; attempt 3, after that fix, lost
+altitude control entirely - see the sim-clock bug below - so a search was
+never reached); telemetry confirms position and altitude (met); simulated
+observations are generated (not met, same reasons); the mission returns
+home (not met - the script's own hard wall-clock timeout forced landing
+both times a flight got that far, never the mission's own `RETURN_HOME`
+sequence); the vehicle lands (met - safely, on all three attempts, either
+via the gate refusing to arm or via the script's own forced `LAND`); disarm
+is confirmed (met when arming succeeded); no collision occurs (met);
+actuator exchange is logged when available (met - up to 171
+`SERVO_OUTPUT_RAW` messages captured per attempt); no safety gate was
+bypassed (met - every fix below widens or corrects the mission's own
+internal safety/timing logic, none weakens or bypasses a check). **The
+most serious finding**: attempt 3 reached a measured peak altitude of
+8.05 m, over 4x the 2.0 m hard ceiling, due to the transport's simulation
+clock never advancing (see bug 4 below) - now fixed, but not yet
+re-verified live.
 
 ## Offline results
 
@@ -323,8 +338,9 @@ testing** (both now covered by regression tests):
    own boundary, so `SafetySupervisor` immediately raised a persistent
    `GEOFENCE_RISK` override before the mission could ever leave
    `TAKEOFF_REQUESTED`. Fixed by `SARMissionConfig.build_geofence()` now
-   enclosing **both** `home_m` and the search area, each with
-   `geofence_margin_m` of buffer.
+   enclosing **both** `home_m` and the search area, each with buffer (see
+   bug 3 below for why that buffer had to be widened again after the
+   first live run).
 2. **Landing never completed**: with the geofence floor set exactly at
    ground level (`0.0`), `SafetySupervisor`'s own altitude-floor
    protection (a no-go boundary, not a landing target) prevented the
@@ -337,14 +353,148 @@ testing** (both now covered by regression tests):
 
 ## Live results
 
-**Not yet attempted this phase.** No arm/takeoff/land/search/land command
-has been sent to a real Webots/ArduPilot SITL process. `run_dry_run` and
-the CLI's `--offline` mode have been verified; the live gate function
-(`_check_sar_live_gate`) has been exercised via `--dry-run` only. Per the
-phase's own instruction ("do not run a live mission until all offline
-tests pass and the report is reviewed"), the live run is deferred to a
-future turn with explicit operator go-ahead, exactly as Phase 13's own
-live run was.
+**First live attempt (operator-run, `--search-altitude 1.0 --duration 60`,
+real ArduPilot SITL + Webots `iris.wbt`, geofence enabled via
+`docs/phase10_sitl_geofence.parm`)**: the flight itself succeeded honestly
+(armed, climbed to a measured peak of **1.09 m** - target 1.0 m, `pass`,
+within the 0.15 m tolerance and the 2.0 m hard ceiling - landed, and
+disarm was confirmed), but **the SAR mission logic never worked**: it
+stayed in `TAKEOFF_REQUESTED` for the entire flight
+(`waypoints_completed: 0`, `observations_generated: 0`) - the vehicle
+only hovered near home before the live script's own outer hard timeout
+forced a direct `LAND`, never the mission's intended `RETURN_HOME ->
+LAND_REQUESTED` sequence.
+
+**Third real bug found - this time only by the live run (offline testing
+could not have caught it)**: `build_geofence()`'s one-`geofence_margin_m`
+buffer
+   placed `home_m` exactly on the same threshold distance that
+   `SafetySupervisor.geofence_horizontal_margin_m()` uses to raise
+   `GEOFENCE_RISK` - not strictly inside it. `FakeSITLTransport`'s
+   noiseless offline kinematics sits exactly on that boundary and never
+   crosses it, but the real SITL vehicle's GPS/accel noise and PID
+   hunting crossed it on 86 of ~90 ticks, permanently overriding every
+   candidate and preventing the mission from ever confirming "search
+   altitude reached." Fixed by widening the buffer to `2 *
+   geofence_margin_m`, giving `home_m` a full `geofence_margin_m` of real
+   headroom inside the risk band - verified offline
+   (`geofence_horizontal_margin_m(home_m, geofence) > geofence_margin_m`,
+   regression-tested in `test_home_sits_with_real_headroom_inside_the_geofence_risk_margin`)
+   and by re-running the same offline scenario the live flight used
+   (`waypoints_completed: 3`, `observations_generated: 114`,
+   `confirmed_victims: 1`, zero `GEOFENCE_RISK` ticks, `final_state:
+   LANDED`).
+
+**Second live attempt (same command, after the geofence-margin fix)**:
+arming was rejected outright (`result=4`, `MAV_RESULT_FAILED`) with no
+accompanying STATUSTEXT - traced to ArduPilot's real-time `SYS_STATUS`
+PREARM_CHECK health bit flapping unhealthy for a few seconds at a time
+while the rate-limited "PreArm: ..." STATUSTEXT banner our own gate
+scans for happened to stay quiet, so the gate reported "clear" while the
+vehicle was still momentarily unhealthy. Fixed by gating the arm attempt
+on that real-time health bit directly (3 consecutive healthy reads,
+`_wait_for_stable_prearm_health`) instead of a fixed STATUSTEXT window,
+and by recording the actual STATUSTEXT reasons for any arm/takeoff/land
+rejection instead of discarding them.
+
+**Third live attempt (same command, after the arm-gate fix)**: this time
+armed and took off cleanly, but the SAR mission control loop produced a
+**serious, real safety-relevant failure**: measured peak altitude reached
+**8.05 m** - more than 4x the documented 2.0 m hard safety ceiling - and
+measured speed reached 1.72 m/s against a configured 0.25 m/s cap. The
+vehicle landed and disarmed safely once the script's own outer timeout
+forced a `LAND`, but the SAR mission's own command loop lost control of
+altitude for the full ~90 second flight.
+
+**Fourth real bug found - the most serious of the four, and only visible
+live**: `ArduPilotSITLTransport` never advances its own simulation clock
+automatically (unlike `FakeSITLTransport.step()`, which calls
+`set_sim_time()` internally - see the transport's own "Clock model"
+docstring) - the live tick loop never called `transport.set_sim_time()`,
+so every telemetry sample was timestamped `0.0` for the entire flight.
+`SafetySupervisor.evaluate()` computes its own real-dt-based acceleration
+limiter (`bound_velocity_step`) from consecutive telemetry timestamps;
+with `dt_s` clamped to its `1e-3` floor every single tick, that limiter
+treated almost any velocity change as exceeding the allowed acceleration
+and froze each commanded velocity within a hair of the vehicle's own
+last REAL velocity - including its residual post-takeoff climb rate -
+instead of correcting it toward the intended hold/search altitude. The
+vehicle coasted upward on its own residual momentum for far longer than
+intended before the ceiling-avoidance override could gain any real
+authority. The same frozen clock also meant `SARMissionConfig.mission_timeout_s`
+could never fire on its own (elapsed time was always `0.0 - 0.0`),
+relying entirely on this script's separate outer wall-clock deadline to
+end the flight - masking the fact that the mission's own timeout logic
+was inert. Fixed by calling `transport.set_sim_time(time.monotonic() -
+mission_start_wall)` at the top of every tick, before reading telemetry -
+regression-tested structurally in
+`test_live_mission_loop_advances_the_transport_clock_every_tick`
+(`tests/test_phase14_sar_architecture.py`), since this failure mode
+requires a real transport and cannot be reproduced against
+`FakeSITLTransport` (which advances its clock for you).
+
+**Fourth live attempt (operator-run, same command, after the sim-clock
+fix)**: a clear improvement - the mission actually progressed for the
+first time (`TAKEOFF_REQUESTED -> TRANSIT -> RETURN_HOME`, reaching
+`LAND_REQUESTED` as its final state, `observations_generated: 1`,
+`GEOFENCE_RISK` down from 88 ticks to 16), armed/landed/disarmed cleanly.
+But measured peak altitude still reached **3.06 m**, still over the 2.0 m
+hard ceiling (`altitude_result.pass_fail: "fail"`) - much smaller than
+the 8.05 m excursion, but still a real ceiling breach, not a pass.
+
+**Fifth real bug found**, traced from the actual per-tick `commands.csv`/
+`telemetry.csv` for this run: at the moment `SARMission`'s tick loop took
+over from ArduPilot's own internal takeoff climb, the vehicle still had
+real residual upward velocity (`+1.36 m/s`, matching Phase 13's own
+well-documented takeoff-overshoot-then-settle pattern - not itself a
+bug). The very first `SafetySupervisor.evaluate()` call for a newly-
+tracked vehicle has no prior timestamp to compute a real `dt` from, so it
+falls back to `SafetySupervisorConfig.fallback_dt_s`, which defaults to
+`1/24 s` - a frame-rate assumption tuned for a much faster control loop
+elsewhere in this codebase, not this mission's ~1 Hz live tick rate. That
+tiny fallback `dt` gave the very first, momentum-critical correction an
+acceleration budget roughly 24x too small (observed: commanded
+`vz` barely moved from `+1.36` to `+1.20 m/s` on that first tick, instead
+of a realistic one-second correction), so the vehicle kept coasting
+upward on real leftover momentum for another two full ticks before a
+correctly-sized `dt` took over on tick 2 and the ceiling-avoidance
+override (a steady, correct `-0.125 m/s`) finally brought it back down.
+Fixed two ways: `SARMissionConfig.build_safety_config()` now passes
+`fallback_dt_s=self.dt_s` instead of leaving the mismatched default, and
+the live script now sets `sar_config.dt_s = _MISSION_TICK_DT_S` (its own
+real per-tick sleep interval, `1.0s`) right after building the config, so
+that fallback matches the live loop's actual cadence - regression-tested
+in `test_build_safety_config_uses_mission_dt_as_the_first_tick_fallback`
+and `test_explicit_safety_config_override_is_not_clobbered`
+(`tests/test_phase14_sar_mission.py`).
+
+**Fifth live attempt (operator-run, same command, after the fallback_dt_s
+fix)**: the two safety-critical bugs are confirmed fixed. The mission
+again progressed properly (`TAKEOFF_REQUESTED -> ... -> LAND_REQUESTED`,
+`observations_generated: 1`, armed/landed/disarmed cleanly), and this
+time measured peak altitude was **1.70 m - within the 2.0 m hard ceiling**
+(`altitude_result.within_hard_ceiling: true`). The prearm-health gate
+also proved itself: it correctly waited through 80 samples, including
+several genuinely unhealthy ones, before letting the arm attempt proceed
+(compare the first arm-gate fix's typical 3-sample case).
+
+The remaining `altitude_result.pass_fail: "fail"` is a much smaller,
+different kind of finding: the peak overshot the 1.0 m target by 0.70 m
+(+70%, outside the 0.15 m tolerance band) while staying safely under the
+hard ceiling - the same *category* of real, physical takeoff-overshoot
+behavior already documented and accepted for Phase 13's own live run
+(2.11 m vs. a 2.0 m target), not a new safety bug. It is plausibly the
+same residual post-takeoff-momentum handoff effect at a smaller
+magnitude now that the timing fix is in, and could be further reduced by
+waiting for vertical velocity (not just altitude) to settle before
+handing off from ArduPilot's own takeoff to the mission's tick loop -
+left as a documented, non-blocking characteristic pending operator
+direction rather than chased further on its own.
+
+Two safety-relevant bugs (the frozen sim-clock and the mismatched
+fallback `dt`) are now fixed and live-verified. A further live attempt
+to tighten the tolerance-band overshoot, or to move on to reviewing
+Phase 14 as a whole, is an operator decision, not assumed.
 
 ## Limitations
 
