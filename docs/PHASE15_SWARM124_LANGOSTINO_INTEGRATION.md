@@ -172,14 +172,33 @@ own smoke test caught before any test file was even written.
 
 ## One-drone results
 
-**Not yet attempted.** Phase 15D (run one external-policy fixture through
-`SafetySupervisor` and a real ArduPilot/Webots vehicle) requires the same
-live Webots environment as Phase 14B. At the time of this document,
-ArduPilot SITL was up and reachable, but Webots' own simulation could not
-be brought into a running state from this automated environment (see
-docs/PHASE14_SAR_WEBOTS.md's own live-attempt log for the parallel
-Phase 14B blocker) - a real, discovered limitation of driving Webots' GUI
-from a non-interactive shell, not a Phase 15 code defect.
+**Built and offline-verified; live Webots attempt not yet made.**
+Phase 15D (`swarm_sim/external_policy_mission.py`,
+`scripts/run_phase15d_external_policy_mission.py`) drives a single
+vehicle from `ScriptedSwarm124Policy.act()` through
+`convert_swarm124_action_to_candidate()` (Phase 15A's shared validation
+pipeline) through `SafetySupervisor.evaluate()` to an `AdapterCommand` -
+mirroring `SARMission`'s own command path
+(`swarm_sim/sar_mission.py`) exactly, but driven by the external policy
+instead of the SAR search pattern. It never arms or takes off a vehicle
+itself - the live script's own arm/takeoff sequence (reusing Phase 13/14's
+gated helpers unmodified, including the vertical-speed-settle fix - see
+docs/PHASE14_SAR_WEBOTS.md) always runs first, and the policy is only
+ever constructed afterward (structurally proven in
+`tests/test_phase15d_external_policy_architecture.py::test_live_script_arm_and_takeoff_precede_any_policy_construction`).
+
+Offline (`--offline`, against `FakeSITLTransport`, starting the vehicle
+already at `search_altitude_m` to stand in for a real arm+takeoff having
+already happened): reaches its target, lands, and disarms cleanly with
+zero external-contract rejections, zero `SafetySupervisor` rejections,
+and zero geofence violations - full command-path evidence without
+needing Webots. The live Webots run itself (arm -> takeoff -> policy ->
+land -> disarm against real ArduPilot SITL/Webots telemetry) has not yet
+been attempted - see docs/PHASE14_SAR_WEBOTS.md's own live-attempt log:
+this environment's earlier finding that Webots' GUI could not be brought
+into a running state from an automated shell was resolved by the
+operator running Webots/SITL directly, which is exactly how a Phase 15D
+live attempt would need to proceed too, once requested.
 
 ## Two-drone results
 
@@ -205,8 +224,11 @@ or real Langostino/INAV hardware.
   (magnitude, noise, latency) resembles the deterministic scripted policy
   used for this phase's first pass - Phase 15B explicitly required a
   learned model NOT be required for this pass, and none was used.
-- Everything Phase 15D/15E would have exercised: real telemetry evidence,
-  actual actuator response, real two-vehicle routing/identity.
+- Everything a LIVE Phase 15D/15E run would exercise: real telemetry
+  evidence against actual ArduPilot/Webots physics, actual actuator
+  response, real two-vehicle routing/identity. Phase 15D's offline
+  verification exercises the full command-path logic but not real
+  physics/timing.
 
 ## Why neither external project is treated as a safety-certified flight stack
 
@@ -246,12 +268,26 @@ position.
 - `tests/test_phase15_swarm124_adapter.py` (new, 20 tests)
 - `tests/test_phase15_langostino_reference.py` (new, 15 tests)
 - `tests/test_phase15_external_architecture.py` (new, 11 tests)
+- `swarm_sim/external_policy_mission.py` (new, Phase 15D) -
+  `ExternalPolicyMissionConfig`, `ExternalPolicyMission`,
+  `run_external_policy_mission_offline` - mirrors
+  `swarm_sim/sar_mission.py`'s own SARMission pattern, driven by the
+  external policy instead of the SAR search pattern
+- `scripts/run_phase15d_external_policy_mission.py` (new, Phase 15D) -
+  live glue script; reuses Phase 10/12/13/14's gate/arm/takeoff/land
+  helpers unmodified, never redefines them
+  (`tests/test_phase15d_external_policy_architecture.py`)
+- `tests/test_phase15d_external_policy_mission.py` (new, 23 tests)
+- `tests/test_phase15d_external_policy_architecture.py` (new, 15 tests)
 - `docs/PHASE15_SWARM124_LANGOSTINO_INTEGRATION.md` (this file)
 
 `swarm_sim/distributed_consensus.py`, `swarm_sim/safety_supervisor.py`,
-and every Phase 10-14 file are **unmodified** this phase.
+and every Phase 10-13 file are **unmodified** this phase.
+`swarm_sim/sar_mission.py` and `scripts/run_phase14_sar_mission.py` had
+one shared latent bug fixed (see "bugs found" below) but their own SAR
+mission behavior, gates, and tests are otherwise unchanged.
 
-## Two real bugs found and fixed by this phase's own offline testing
+## Bugs found and fixed by this phase's own offline testing
 
 1. **NaN direction silently became a zero-velocity command instead of
    being rejected**: `convert_swarm124_action_to_candidate`'s original
@@ -274,6 +310,31 @@ and every Phase 10-14 file are **unmodified** this phase.
    sentinel altitude when invalid, never a NaN, with the health flags
    doing the real work of telling the caller not to trust it -
    regression-tested in `test_invalid_altitude_degrades_without_crashing`.
+3. **A "since"/"at" timestamp using `X or now_s` silently reset itself
+   every tick whenever the stored value was exactly `0.0`** (found while
+   writing Phase 15D's own landing-timeout test): `0.0` is falsy in
+   Python, so `self._land_requested_at_s = self._land_requested_at_s or
+   now_s` re-evaluates to `now_s` on every subsequent tick instead of
+   preserving the original timestamp once it happens to be `0.0` -
+   permanently defeating that grace-period/timeout check for the
+   remainder of the mission. `now_s` can legitimately be exactly `0.0`
+   live (the live script explicitly starts its sim clock at `0.0` - see
+   docs/PHASE14_SAR_WEBOTS.md). This exact pattern was copied faithfully
+   from `SARMission` (`swarm_sim/sar_mission.py`) into the new
+   `ExternalPolicyMission`, which is how it was noticed; fixed in **both**
+   modules (6 call sites each) using an explicit `if self._X is None:
+   self._X = now_s` instead of `or`. Phase 14's own live-flight test
+   history did not happen to hit this exact boundary, but it was a real,
+   latent correctness defect in already-shipped safety-timing code, not
+   just this phase's own new module.
+4. **The offline runner started the vehicle at ground level, never
+   flying**: `run_external_policy_mission_offline`'s `FakeSITLTransport`
+   originally started at `home_m` (ground, `z=0`) - since this mission
+   never itself commands a climb (a real arm+takeoff always happens
+   first, live), the offline stand-in silently exercised the full
+   command path at `z=0` the whole run, an incomplete stand-in for the
+   "already airborne" precondition. Fixed by starting at
+   `search_altitude_m` instead, matching the live precondition.
 
 ## Validation
 

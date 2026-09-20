@@ -453,7 +453,8 @@ class SARMission:
             return TickResult()
 
         if not telem.estimator_valid:
-            self._estimator_invalid_since_s = self._estimator_invalid_since_s or now_s
+            if self._estimator_invalid_since_s is None:
+                self._estimator_invalid_since_s = now_s
             if now_s - self._estimator_invalid_since_s > self.config.estimator_invalid_grace_s:
                 self._transition(MissionState.FAILED, "estimator_invalid_persisted")
                 return TickResult()
@@ -461,7 +462,8 @@ class SARMission:
             self._estimator_invalid_since_s = None
 
         if telem.failsafe:
-            self._heartbeat_lost_since_s = self._heartbeat_lost_since_s or now_s
+            if self._heartbeat_lost_since_s is None:
+                self._heartbeat_lost_since_s = now_s
             if now_s - self._heartbeat_lost_since_s > self.config.heartbeat_loss_grace_s:
                 self._transition(MissionState.FAILED, "heartbeat_or_link_loss_persisted")
                 return TickResult()
@@ -469,7 +471,8 @@ class SARMission:
             self._heartbeat_lost_since_s = None
 
         if now_s - telem.timestamp_s > self.config.stale_telemetry_max_age_s:
-            self._stale_telemetry_since_s = self._stale_telemetry_since_s or now_s
+            if self._stale_telemetry_since_s is None:
+                self._stale_telemetry_since_s = now_s
             if now_s - self._stale_telemetry_since_s > self.config.stale_telemetry_max_age_s:
                 self._transition(MissionState.FAILED, "stale_telemetry_persisted")
                 return TickResult()
@@ -483,7 +486,17 @@ class SARMission:
             self._transition(MissionState.LAND_REQUESTED, "mission_timeout_emergency_land")
 
         if self.state == MissionState.LAND_REQUESTED:
-            self._land_requested_at_s = self._land_requested_at_s or now_s
+            # `is None`, never `or` - now_s (or a stored "since" timestamp)
+            # can legitimately be exactly 0.0 (the live script explicitly
+            # starts its sim clock at 0.0), and 0.0 is falsy in Python, so
+            # `self._land_requested_at_s or now_s` would silently reset
+            # this to the CURRENT now_s on every tick instead of preserving
+            # the original timestamp, permanently defeating this timeout
+            # check - a real bug found while writing an analogous check for
+            # Phase 15D (swarm_sim/external_policy_mission.py). The same
+            # fix applies to every "_since_s"/"_at_s" timer below.
+            if self._land_requested_at_s is None:
+                self._land_requested_at_s = now_s
             if now_s - self._land_requested_at_s > self.config.landing_timeout_s:
                 self._transition(MissionState.FAILED, "landing_timeout_exceeded")
                 return TickResult()
@@ -559,7 +572,8 @@ class SARMission:
                 candidate_target = self.search_pattern.current_waypoint
 
         if self.state == MissionState.RETURN_HOME:
-            self._return_home_started_at_s = self._return_home_started_at_s or now_s
+            if self._return_home_started_at_s is None:
+                self._return_home_started_at_s = now_s
             candidate_target = (self.config.home_m[0], self.config.home_m[1], self.config.search_altitude_m)
             if math.dist(telem.position_m, candidate_target) <= self.config.waypoint_reach_tolerance_m:
                 self._transition(MissionState.LAND_REQUESTED, "home_reached_requesting_land")
@@ -598,7 +612,8 @@ class SARMission:
             self.geofence_violation_ticks += 1
 
         if not decision.accepted:
-            self._first_rejection_at_s = self._first_rejection_at_s or now_s
+            if self._first_rejection_at_s is None:
+                self._first_rejection_at_s = now_s
             self._log_event("safety_supervisor_rejected_candidate", reason=decision.reason)
             if now_s - self._first_rejection_at_s > self.config.command_timeout_s:
                 self._transition(MissionState.FAILED, "command_timeout_supervisor_rejected")
