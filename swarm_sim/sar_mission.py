@@ -186,8 +186,20 @@ class SARMissionConfig:
         # altitude before a realistic dt took over on the next tick. Using
         # this mission's own `dt_s` instead gives that first correction a
         # realistic budget - see docs/PHASE14_SAR_WEBOTS.md.
+        #
+        # link_timeout_s (own last-valid-command staleness -> DEGRADED_LINK/
+        # RETURN_TO_SAFE_POINT) defaults to 1.0s in SafetySupervisorConfig -
+        # again sized for a faster swarm-sim loop. At this mission's own
+        # ~1Hz live tick rate a single normal tick interval already meets
+        # or exceeds that 1.0s, so every live run tripped RETURN_TO_SAFE_POINT
+        # on its second tick regardless of any real fault, aborting before
+        # any search waypoint was reached (found via live testing - see
+        # docs/PHASE14_SAR_WEBOTS.md). Scaled to 2x `dt_s`, matching this
+        # mission's own existing convention for `estimator_invalid_grace_s`/
+        # `heartbeat_loss_grace_s`/`stale_telemetry_max_age_s` (all 2x the
+        # ~1Hz tick period) so one tick's jitter can't trip it.
         return SafetySupervisorConfig(max_speed_mps=self.max_speed_mps, geofence_margin_m=self.geofence_margin_m,
-                                       fallback_dt_s=self.dt_s)
+                                       fallback_dt_s=self.dt_s, link_timeout_s=2.0 * self.dt_s)
 
     def build_geofence(self) -> GeofenceSpec:
         """A geofence that safely encloses BOTH the search area and

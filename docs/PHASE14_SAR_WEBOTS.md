@@ -540,6 +540,55 @@ and per the operator's own instruction the script did not retry
 automatically or bypass the check. A further live attempt is an operator
 decision.
 
+**Seventh live attempt (same bounded command, in a later session)**: all
+pre-flight gates passed and the SITL process itself connected to Webots'
+controller, loaded parameters, and set home - then the `arducopter`
+process exited on its own before sending its first heartbeat, with no
+crash trace, no OOM kill, and no signal evidence found (`dmesg`,
+`journalctl -k`, `free` all clean). The attach step correctly timed out
+after 20s and reported the failure cleanly (`flight_actually_happened:
+false`, `shutdown.clean: true`) rather than hanging or forcing a retry.
+Root cause not identified; treated as a one-off SITL-side fault pending
+recurrence, since the very next operator-run attempt (below) succeeded
+against the same Webots session.
+
+**Eighth live attempt (operator-run, same bounded command)**: arm,
+takeoff, land, and disarm all succeeded (`flight_actually_happened:
+true`), geofence held (0 violation ticks), peak altitude 1.42 m - within
+the 2.0 m hard ceiling. But the mission aborted to `RETURN_HOME` after
+only 1.0s in `TRANSIT`, before reaching any search waypoint
+(`waypoints_completed: 0`, the one victim missed).
+
+**Sixth real bug found**, traced from `safety_decisions.csv`: the very
+first tick logged `"last valid command was 1.00s ago (timeout 1.0s)"` and
+`SafetySupervisor` forced `RETURN_TO_SAFE_POINT`. `SafetySupervisorConfig.
+link_timeout_s` defaults to `1.0s` - sized for the same faster swarm-sim
+loop `fallback_dt_s` was tuned for, not this mission's own ~1 Hz live tick
+rate. At that cadence a single normal tick interval (measured here at
+`1.0017s`) already meets or exceeds the timeout, so `RETURN_TO_SAFE_POINT`
+fired on literally the second tick of every live run regardless of any
+real fault. Fixed by scaling it in `build_safety_config()`:
+`link_timeout_s=2.0 * self.dt_s`, matching this mission's own existing
+convention for `estimator_invalid_grace_s`/`heartbeat_loss_grace_s`/
+`stale_telemetry_max_age_s` (already `2.0` against `dt_s=1.0`) so one
+tick's jitter can't trip it - regression-tested in
+`test_build_safety_config_scales_link_timeout_to_the_mission_tick_rate`
+(`tests/test_phase14_sar_mission.py`). Not yet re-verified live; a further
+live attempt is an operator decision.
+
+Separately, `altitude_result.pass_fail: "fail"` again (peak 1.42 m vs. a
+1.0 m target, +42%, outside the 0.15 m tolerance band) - the same
+category of residual post-takeoff-momentum overshoot already documented
+above, not a new safety bug, and smaller in absolute terms than the fifth
+attempt's 0.70 m overshoot. Also noted: `sar_summary.landing_result` read
+`false` even though the live script's own direct MAVLink land/disarm
+confirmation (`land.accepted`, `disarm_confirmed`) both read `true` -
+`SARMission`'s internal state machine has no tick call after
+`LAND_REQUESTED` in live mode to advance it to `LANDED`, so its own
+summary undercounts a landing the live script's real telemetry already
+confirmed. Cosmetic reporting gap, not a safety issue; left undocumented-fix
+pending operator direction.
+
 ## Limitations
 
 - The live mode's SAR-search phase (velocity setpoints via

@@ -396,6 +396,19 @@ class TestCommandPath:
         safety_config = config.build_safety_config()
         assert safety_config.fallback_dt_s == 1.0
 
+    def test_build_safety_config_scales_link_timeout_to_the_mission_tick_rate(self):
+        """Regression for a fourth live finding: SafetySupervisorConfig's own
+        link_timeout_s (1.0s) is also tuned for a fast swarm-sim loop. At
+        this mission's ~1Hz live tick rate a single normal tick interval
+        already meets or exceeds 1.0s, so every live run tripped
+        RETURN_TO_SAFE_POINT on its second tick regardless of any real
+        fault, aborting before any search waypoint was reached. Scaled to
+        2x dt_s, matching this mission's own estimator_invalid_grace_s/
+        heartbeat_loss_grace_s/stale_telemetry_max_age_s convention."""
+        config = _config(dt_s=1.0)
+        safety_config = config.build_safety_config()
+        assert safety_config.link_timeout_s == 2.0
+
     def test_explicit_safety_config_override_is_not_clobbered(self):
         override = SafetySupervisorConfig(max_speed_mps=0.1, geofence_margin_m=3.0, fallback_dt_s=2.5)
         config = _config(dt_s=1.0, safety_config=override)
