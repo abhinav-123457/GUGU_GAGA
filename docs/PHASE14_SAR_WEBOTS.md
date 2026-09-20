@@ -589,6 +589,79 @@ summary undercounts a landing the live script's real telemetry already
 confirmed. Cosmetic reporting gap, not a safety issue; left undocumented-fix
 pending operator direction.
 
+**Ninth live attempt (operator-run, same bounded command, after the
+`link_timeout_s` fix)**: confirmed the fix - the mission ran its real
+`TRANSIT` logic for a full 2 seconds instead of aborting at 1 second.
+That, in turn, fully exposed the takeoff-momentum-handoff overshoot
+already noted above: real telemetry showed `vz=+1.35 m/s` still present
+the instant the mission's tick loop took over (right after
+`takeoff_confirmed` at 0.89 m), climbing the vehicle to `z=1.5m` by
+`t=1.0s` and `z=1.78m` by `t=2.0s` before vz finally settled near zero -
+at which point `GEOFENCE_RISK` correctly fired
+(`"altitude 1.78m within 0.5m of ceiling 2.0m"`) and forced `RETURN_HOME`,
+again before any search waypoint was reached. Landed/disarmed cleanly;
+0 geofence violation ticks; 1.78 m stayed within the 2.0 m hard ceiling.
+
+**Seventh real bug found**: the climb-confirmation loop in
+`run_live_sar_mission` (`scripts/run_phase14_sar_mission.py`) handed
+control to the mission's own ~1Hz safety-supervised tick loop as soon as
+altitude reached 80% of target - never checking vertical speed. ArduPilot's
+own takeoff controller was still actively climbing at that instant, so the
+handoff transferred real, large residual momentum to a control loop that
+can only bleed it off gradually, at exactly the moment it matters most.
+Fixed by also requiring vertical speed to have settled (reusing
+`HARD_MAX_SPEED_MPS` as the settle threshold) before breaking out of the
+climb-wait loop, bounded by the same existing `_TAKEOFF_CLIMB_TIMEOUT_S` -
+regression-tested (AST-based, since this loop only runs against a real
+transport) in
+`test_takeoff_handoff_waits_for_vertical_speed_to_settle_not_altitude_alone`
+(`tests/test_phase14_sar_architecture.py`). Not yet re-verified live; a
+further live attempt is an operator decision.
+
+**Tenth live attempt (operator-run, same bounded command, after the
+vertical-speed-settle fix)**: the mission flew for real. Sequence from
+`mission_events.jsonl`: `TAKEOFF_REQUESTED -> TRANSIT` (t=0s) ->
+`SEARCHING` (t=5.0s, first waypoint reached) -> `DETECTION_CANDIDATE`
+(t=29.1s, a real candidate detection of the victim) -> back to
+`SEARCHING` (t=30.1s, candidate not repeated within the confirmation
+window) -> `LAND_REQUESTED` (t=60.2s, the hard 60s mission-duration cap
+correctly firing `mission_timeout_emergency_land` while still
+`SEARCHING`, landing in place rather than attempting `RETURN_HOME` -
+exactly the documented timeout behavior). Armed/took
+off/landed/disarmed cleanly; `waypoints_completed: 1` (the
+`--max-search-waypoints 2` segment cap itself was never reached - the
+60s duration budget ran out first, not a bug); one victim candidate
+detection generated but never confirmed (needs a second corroborating
+observation the search pattern didn't produce in time - a real, benign
+search-timing/geometry limitation, not a safety issue).
+
+The takeoff-handoff fix is confirmed live: peak altitude was **1.22 m
+(+0.22 m, +22% over the 1.0 m target)** - down from 0.78 m/+78% and
+0.42 m/+42% in the two attempts before this fix - and altitude then held
+in a tight **0.98-1.03 m band for 53 of 61 ticks**
+(`altitude_result.hold_band_m`). `safety_state_histogram` was `NORMAL`
+for 57 of 61 ticks (`DEGRADED_SENSOR` for the remaining 4, the same
+already-documented "degraded, not blocked" pattern) - zero
+`RETURN_TO_SAFE_POINT`, zero `GEOFENCE_RISK`, zero geofence violation
+ticks over a full ~60s live search, the first time this phase's safety
+path has been exercised end-to-end over a real extended live duration
+rather than aborting in the first 1-2 seconds.
+
+`altitude_result.pass_fail` is still `"fail"` (22% over the 0.15 m
+tolerance band) - the same residual takeoff-momentum category as before,
+now much smaller, and a further tightening (e.g. lowering the
+vertical-speed-settle threshold below `HARD_MAX_SPEED_MPS`) is an
+operator decision rather than chased further unprompted.
+
+**Phase 14B is considered complete for this bounded scenario**: a live
+one-drone mission ran its real `SARMission`/`SafetySupervisor`/adapter
+path for a full ~60s duration, moved, searched, produced a real
+detection candidate, and landed/disarmed safely under its own documented
+hard-timeout behavior - satisfying the operator's own closure criterion
+of "completed successfully with telemetry evidence." A full, unbounded
+90s/6-waypoint run, or victim-confirmation tuning, remain operator
+decisions for a future attempt.
+
 ## Limitations
 
 - The live mode's SAR-search phase (velocity setpoints via

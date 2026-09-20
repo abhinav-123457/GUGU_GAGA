@@ -237,6 +237,42 @@ def _wait_for_stable_prearm_health(conn, sysid: int, compid: int, timeout_s: flo
     return {"stable_healthy": False, "samples": samples}
 
 
+def _wait_for_climb_and_vz_to_settle(transport, vehicle_id: str, target_altitude_m: float,
+                                      climb_timeout_s: float, max_vertical_speed_mps: float) -> float:
+    """Waits for BOTH altitude (>=80% of target) and vertical speed
+    (settled within max_vertical_speed_mps) before handing control from
+    ArduPilot's own takeoff climb to a slower, safety-supervised tick loop.
+
+    Waiting on altitude alone handed control over while ArduPilot's own
+    takeoff climb still had real residual vertical velocity (observed
+    live: +1.35 m/s at handoff) - a slower (~1Hz) tick loop can then only
+    bleed that off gradually, letting the vehicle coast well past its
+    target altitude for another 1-2 seconds and trip a geofence
+    altitude-ceiling risk before ever doing useful work (see the Phase 14B
+    "eighth live attempt" in docs/PHASE14_SAR_WEBOTS.md). Bounded by
+    climb_timeout_s; returns whatever peak altitude was observed even if
+    that bound is hit without both conditions being met, matching this
+    phase's existing "report honestly, never hang" pattern - the caller
+    decides what an insufficient climb means for its own report.
+
+    Extracted so any live tick loop that hands off from a real ArduPilot
+    takeoff (not just SARMission's own) gets this fix for free instead of
+    re-deriving or forgetting it - see Phase 15D's own live script."""
+    climb_deadline = time.monotonic() + climb_timeout_s
+    max_alt_observed = 0.0
+    while time.monotonic() < climb_deadline:
+        telem = transport.receive_telemetry(vehicle_id)
+        if telem.position_m is not None:
+            max_alt_observed = max(max_alt_observed, telem.position_m[2])
+            altitude_reached = telem.position_m[2] >= target_altitude_m * 0.8
+            vertical_speed_settled = (telem.velocity_mps is None
+                                       or abs(telem.velocity_mps[2]) <= max_vertical_speed_mps)
+            if altitude_reached and vertical_speed_settled:
+                break
+        time.sleep(0.2)
+    return max_alt_observed
+
+
 def _operator_confirmed(args) -> bool:
     if args.confirm_webots_flight_test:
         return True
@@ -459,15 +495,8 @@ def run_live_sar_mission(args) -> dict:
             emergency_cleanup("takeoff rejected after arming")
             return report
 
-        climb_deadline = time.monotonic() + _TAKEOFF_CLIMB_TIMEOUT_S
-        max_alt_observed = 0.0
-        while time.monotonic() < climb_deadline:
-            telem = transport.receive_telemetry(vehicle_id)
-            if telem.position_m is not None:
-                max_alt_observed = max(max_alt_observed, telem.position_m[2])
-                if telem.position_m[2] >= sar_config.search_altitude_m * 0.8:
-                    break
-            time.sleep(0.2)
+        max_alt_observed = _wait_for_climb_and_vz_to_settle(
+            transport, vehicle_id, sar_config.search_altitude_m, _TAKEOFF_CLIMB_TIMEOUT_S, HARD_MAX_SPEED_MPS)
         report["takeoff"]["max_altitude_observed_m"] = max_alt_observed
         report["flight_actually_happened"] = max_alt_observed > 0.3
         if not report["flight_actually_happened"]:

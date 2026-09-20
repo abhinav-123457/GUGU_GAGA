@@ -177,6 +177,32 @@ def test_live_mission_loop_advances_the_transport_clock_every_tick():
         "set_sim_time() must be called before receive_telemetry() inside the mission tick loop"
 
 
+def test_takeoff_handoff_waits_for_vertical_speed_to_settle_not_altitude_alone():
+    """Regression for a live finding: waiting on altitude alone handed
+    control from ArduPilot's own takeoff to the mission's ~1Hz tick loop
+    while real residual vertical velocity was still +1.35 m/s, letting the
+    vehicle coast well past its target altitude and trip GEOFENCE_RISK's
+    altitude-ceiling band before any search waypoint was reached (see the
+    Phase 14B "eighth live attempt" in docs/PHASE14_SAR_WEBOTS.md). The
+    climb-confirmation loop must also require vertical speed to have
+    settled, not just altitude reached. Extracted into its own
+    _wait_for_climb_and_vz_to_settle() helper so Phase 15D's live script
+    can import and reuse it instead of re-deriving the same fix."""
+    source = _source(phase14)
+    assert "vertical_speed_settled" in source
+    assert "HARD_MAX_SPEED_MPS" in source
+    # both conditions must gate the same break out of the climb-wait loop
+    idx = source.index("altitude_reached = ")
+    snippet = source[idx:idx + 500]
+    assert "if altitude_reached and vertical_speed_settled:" in snippet
+    # and run_live_sar_mission must actually call the extracted helper,
+    # not just define it as unused dead code
+    run_live_fn = next(n for n in ast.walk(_tree(phase14))
+                        if isinstance(n, ast.FunctionDef) and n.name == "run_live_sar_mission")
+    live_source = ast.get_source_segment(source, run_live_fn)
+    assert "_wait_for_climb_and_vz_to_settle(" in live_source
+
+
 # ==========================================================================
 # 3. no six-drone / swarm / consensus / FlightGear / PyBullet
 # ==========================================================================
