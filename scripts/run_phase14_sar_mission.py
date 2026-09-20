@@ -136,6 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-speed", type=float, default=0.25, help=f"hard-capped at {HARD_MAX_SPEED_MPS} m/s")
     parser.add_argument("--duration", type=float, default=90.0,
                          help=f"mission timeout in seconds, hard-capped at {HARD_MISSION_DURATION_S}s")
+    parser.add_argument("--max-search-waypoints", type=int, default=None,
+                         help="stop the search early after this many waypoints and return home, even if the "
+                              "pattern isn't complete and nothing was confirmed - for validating a short bounded "
+                              "segment of the command/telemetry path before running the full pattern live")
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--offline", action="store_true",
@@ -153,7 +157,7 @@ def _sar_config_from_args(args) -> SARMissionConfig:
         search_area=RectangularSearchArea(0.0, 0.0, args.search_width_m, args.search_height_m),
         search_altitude_m=args.search_altitude, lane_spacing_m=args.lane_spacing_m, geofence_margin_m=1.0,
         victim_positions_m=((args.victim_x, args.victim_y),), max_speed_mps=args.max_speed,
-        mission_timeout_s=args.duration,
+        mission_timeout_s=args.duration, max_search_waypoints=args.max_search_waypoints,
     )
 
 

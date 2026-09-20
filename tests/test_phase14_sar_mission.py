@@ -23,7 +23,8 @@ from swarm_sim.autopilot.types import AdapterResult, AutopilotMode, ConnectionSt
 from swarm_sim.contracts import DetectionCandidate, Frame, SensorObservation
 from swarm_sim.safety_supervisor import SafetySupervisor, SafetySupervisorConfig, geofence_horizontal_margin_m
 from swarm_sim.sar_mission import (
-    ALLOWED_TRANSITIONS, MissionState, SARMission, SARMissionConfig, TERMINAL_STATES, run_sar_mission_offline,
+    ALLOWED_TRANSITIONS, MissionState, SARMission, SARMissionConfig, TERMINAL_STATES, _DetectionCluster,
+    run_sar_mission_offline,
 )
 from swarm_sim.sar_search import LawnmowerSearchPattern, generate_lawnmower_waypoints, velocity_toward
 from swarm_sim.sar_world import RectangularSearchArea, SARWorld, SensorModelConfig
@@ -182,6 +183,47 @@ class TestSearchPattern:
     def test_velocity_toward_caps_at_max_speed(self):
         v = velocity_toward((0.0, 0.0, 0.0), (100.0, 0.0, 0.0), max_speed_mps=0.25)
         assert math.isclose(math.dist(v, (0, 0, 0)), 0.25, abs_tol=1e-9)
+
+    def test_max_search_waypoints_returns_home_early_without_confirmation(self):
+        """Phase 14B: validate a short bounded search segment live before
+        running the full pattern - the mission must return home after
+        exactly `max_search_waypoints`, not run the whole lawnmower path,
+        and must say so honestly (a distinct reason from the normal
+        pattern-complete transition)."""
+        config = _config(max_search_waypoints=2)
+        mission = _mission(config)
+        assert mission.search_pattern.waypoint_count > 2  # the full pattern is longer than the cap
+        mission.state = MissionState.SEARCHING
+        t = 0.0
+        for _ in range(2):
+            wp = mission.search_pattern.current_waypoint
+            t += 0.5
+            mission.tick(t, _telem(position_m=wp, timestamp_s=t))
+        assert mission.state == MissionState.RETURN_HOME
+        last_transition = [e for e in mission.events if e.get("event") == "state_transition"][-1]
+        assert last_transition["reason"] == "search_segment_limit_reached"
+        assert mission.search_pattern.waypoints_completed == 2
+
+    def test_max_search_waypoints_none_runs_the_full_pattern(self):
+        config = _config(max_search_waypoints=None)
+        summary = run_sar_mission_offline(config)
+        assert summary["final_state"] == "LANDED"
+
+    def test_max_search_waypoints_never_overrides_an_already_confirmed_detection(self):
+        """The segment cap only applies to the SEARCHING/DETECTION_CANDIDATE
+        branch - once a victim is confirmed (state already moved to
+        DETECTION_CONFIRMED, which transitions to RETURN_HOME on its own,
+        existing path), the cap must never re-fire or change the reason."""
+        config = _config(max_search_waypoints=1)
+        mission = _mission(config)
+        mission.state = MissionState.SEARCHING
+        cluster = _DetectionCluster(centroid_xy=(5.0, 5.0), member_ids=["a", "b"])
+        mission._confirmed_cluster = cluster
+        mission._transition(MissionState.DETECTION_CONFIRMED, "victim_confirmed", cluster_size=2)
+        wp = mission.search_pattern.current_waypoint
+        mission.tick(1.0, _telem(position_m=wp, timestamp_s=1.0))
+        last_transition = [e for e in mission.events if e.get("event") == "state_transition"][-1]
+        assert last_transition["reason"] != "search_segment_limit_reached"
 
     def test_velocity_toward_zero_at_target(self):
         v = velocity_toward((1.0, 2.0, 3.0), (1.0, 2.0, 3.0), max_speed_mps=0.25)

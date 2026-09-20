@@ -496,6 +496,50 @@ fallback `dt`) are now fixed and live-verified. A further live attempt
 to tighten the tolerance-band overshoot, or to move on to reviewing
 Phase 14 as a whole, is an operator decision, not assumed.
 
+## Phase 14B: one-drone live SAR mission
+
+Phase 14A's offline verification and the five Phase-14A live attempts
+above were accepted as the gate to begin Phase 14B - a live SAR mission
+run using the **same** `SARMission`/`SafetySupervisor`/adapter path, this
+time under the operator's explicit instruction not to run the full
+90-second search pattern on the first attempt if a shorter bounded
+segment can validate the complete command/telemetry path.
+
+**New capability**: `SARMissionConfig.max_search_waypoints` (optional,
+default `None` - the full pattern, unchanged for every existing offline
+test) and a matching `--max-search-waypoints` CLI flag. When set, the
+mission returns home after that many waypoints even if the pattern isn't
+complete and nothing was confirmed, logging a distinct, honest reason
+(`search_segment_limit_reached`, never conflated with
+`search_pattern_complete_no_confirmation`). It only changes when
+`SEARCHING`/`DETECTION_CANDIDATE` gives up and returns home - it never
+touches arm/takeoff/land limits, never bypasses `SafetySupervisor`, and
+never overrides an already-confirmed detection (state has already moved
+to `DETECTION_CONFIRMED` by the time this check would run - regression-
+tested in `test_max_search_waypoints_never_overrides_an_already_confirmed_detection`).
+4 new tests (`tests/test_phase14_sar_mission.py`,
+`tests/test_phase14_sar_architecture.py`); full suite: 914 passed.
+Offline re-verification with the new flag (`--offline --max-search-waypoints 2`):
+`final_state: LANDED`, `waypoints_completed: 2`, stopped and landed
+cleanly on the segment cap.
+
+**Sixth live attempt (bounded to 2 waypoints, `--max-search-waypoints 2
+--duration 60`)**: stopped safely before ever arming. The prearm-health
+gate (added after Phase 14A's arm-gate fix) waited the full 20s for
+ArduPilot's real-time PREARM_CHECK health bit to report stably healthy -
+it never did (174 samples). A passive listen confirmed the real,
+currently-active reason: `PreArm: Gyro 0 rate 500Hz < loop rate x1.8
+540Hz` - an ArduPilot scheduler-timing check, most likely real-time
+jitter from running SITL inside WSL2 rather than resource starvation
+(host load average 0.3-0.5 on 12 cores, 8.2 GiB free at the time). No
+arm/takeoff/motion/observations/landing occurred; no mission output files
+were written this attempt (`results/phase14_sar_mission/live/*` are
+unchanged from the prior successful attempt). This is the gate correctly
+refusing to arm a vehicle that was not actually ready, not a code defect,
+and per the operator's own instruction the script did not retry
+automatically or bypass the check. A further live attempt is an operator
+decision.
+
 ## Limitations
 
 - The live mode's SAR-search phase (velocity setpoints via

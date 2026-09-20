@@ -136,6 +136,16 @@ class SARMissionConfig:
     geofence_floor_alt_m: float = -2.0
     geofence_ceiling_alt_m: float = 2.0
 
+    # Optional cap on how many search waypoints to follow before forcing
+    # RETURN_HOME even if the pattern isn't complete and nothing was
+    # confirmed - None (default) runs the full pattern, exactly as every
+    # offline test above exercises. Added for Phase 14B's own "validate
+    # the command/telemetry path on a short bounded segment before running
+    # the full pattern live" requirement (see docs/PHASE14_SAR_WEBOTS.md) -
+    # never changes offline behavior, arm/takeoff/land limits, or any
+    # SafetySupervisor gate.
+    max_search_waypoints: Optional[int] = None
+
     victim_positions_m: Tuple[Vec2, ...] = ((10.0, 10.0),)
     sensor_config: Optional[SensorModelConfig] = None
     confirmation_min_detections: int = 2
@@ -524,9 +534,15 @@ class SARMission:
                 self._transition(MissionState.SEARCHING, "search_pattern_started")
         elif self.state in (MissionState.SEARCHING, MissionState.DETECTION_CANDIDATE):
             self.search_pattern.advance_if_reached(telem.position_m)
+            segment_limit_reached = (self.config.max_search_waypoints is not None
+                                      and self.search_pattern.waypoints_completed
+                                      >= self.config.max_search_waypoints)
             if self.search_pattern.is_complete():
                 candidate_target = (self.config.home_m[0], self.config.home_m[1], self.config.search_altitude_m)
                 self._transition(MissionState.RETURN_HOME, "search_pattern_complete_no_confirmation")
+            elif segment_limit_reached:
+                candidate_target = (self.config.home_m[0], self.config.home_m[1], self.config.search_altitude_m)
+                self._transition(MissionState.RETURN_HOME, "search_segment_limit_reached")
             else:
                 candidate_target = self.search_pattern.current_waypoint
 

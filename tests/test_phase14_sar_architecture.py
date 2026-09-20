@@ -145,6 +145,18 @@ def test_live_script_never_sends_a_raw_candidate_to_the_adapter():
     assert "adapter.send_command(tick_result.adapter_command)" in source
 
 
+def test_max_search_waypoints_cli_flag_reaches_the_mission_config():
+    """Phase 14B's bounded-first-segment requirement must be real CLI
+    plumbing into SARMissionConfig, not just an unused argument."""
+    args = phase14.build_parser().parse_args(["--max-search-waypoints", "2"])
+    assert args.max_search_waypoints == 2
+    config = phase14._sar_config_from_args(args)
+    assert config.max_search_waypoints == 2
+
+    default_args = phase14.build_parser().parse_args([])
+    assert default_args.max_search_waypoints is None
+
+
 def test_live_mission_loop_advances_the_transport_clock_every_tick():
     """Regression for this phase's first live run: ArduPilotSITLTransport
     never advances its own clock automatically (unlike FakeSITLTransport's
