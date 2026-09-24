@@ -30,7 +30,6 @@ import numpy as np
 import pybullet as p
 
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
-from gym_pybullet_drones.control.DSLPIDControl import DSLPIDControl
 from gym_pybullet_drones.utils.enums import DroneModel, Physics
 from gym_pybullet_drones.utils.utils import sync
 
@@ -49,8 +48,11 @@ from .diagnostics import MissionDiagnostics
 from .estimation import EstimatedState, StateEstimator, get_profile, pose_uncertainty_m, to_vehicle_state
 from .estimation.metrics import GeofenceExcursionScorer, LocalizationScorer
 from .estimation.plant_odometry import OdometrySuite
+from .flight import VerticalConfig, VerticalController
+from .flight_scoring import FlightScorer
 from .mapping import MissionMap
 from .network import CommsNetwork
+from .plant_actuator import SimulatedAutopilot
 from .plant_truth import PlantTruth
 from .recruitment import RecruitmentBoard
 from .safety_supervisor import (
@@ -133,6 +135,10 @@ class FloodSearchMission:
             raise ValueError(
                 f"localization_mode must be 'truth_state' or 'estimated', got {config.localization_mode!r}"
             )
+        if config.flight_control_mode not in ("legacy", "altitude_hold"):
+            raise ValueError(
+                f"flight_control_mode must be 'legacy' or 'altitude_hold', got {config.flight_control_mode!r}"
+            )
         self.rng = np.random.default_rng(config.seed)
         self.telemetry = TelemetryHub()
         self.board = RecruitmentBoard(decay_rate=config.beacon_decay_rate)
@@ -164,7 +170,22 @@ class FloodSearchMission:
             ctrl_freq=config.control_freq_hz,
             gui=config.gui,
         )
-        self.pid = [DSLPIDControl(drone_model=DroneModel.CF2X) for _ in range(config.num_drones)]
+        # Phase 16C: the PID (which is fed TRUE state) lives behind the plant-side actuator boundary.
+        # "legacy" reproduces the pre-16C altitude handling operation for operation; "altitude_hold" adds
+        # an outer altitude loop on the drone's own ESTIMATED z and lets the plant track velocity in all
+        # three axes. See docs/PHASE16C_FLIGHT_LIFECYCLE.md.
+        self._altitude_hold = config.flight_control_mode != "legacy"
+        self.autopilot = SimulatedAutopilot(
+            config.num_drones, mode="velocity" if self._altitude_hold else "legacy",
+            flight_altitude_m=config.flight_altitude, safety_enabled=config.safety_enabled,
+            floor_alt_m=config.safety_altitude_floor_m, ceiling_alt_m=config.safety_altitude_ceiling_m,
+            max_accel_mps2=config.autopilot_max_accel_mps2 if self._altitude_hold else None,
+        )
+        self.pid = self.autopilot.pid          # kept for anything that predates the actuator boundary
+        self.vertical = (VerticalController(config.num_drones, VerticalConfig.from_mission_config(config))
+                         if self._altitude_hold else None)
+        self.flight_scorer = FlightScorer(config.num_drones, config.flight_altitude,
+                                          config.safety_altitude_floor_m, config.safety_altitude_ceiling_m)
 
         airframe_max_speed = self.env.MAX_SPEED_KMH * 1000.0 / 3600.0
         self.speed_ctrl = SpeedController(config.num_drones, config.max_speed_mps, airframe_max_speed)
@@ -208,6 +229,8 @@ class FloodSearchMission:
             lost_agent_timeout_s=config.safety_lost_agent_timeout_s,
             pose_sigma_geofence_k=config.safety_pose_sigma_geofence_k,
             pose_sigma_cap_m=config.safety_pose_sigma_cap_m,
+            independent_vertical_axis=self._altitude_hold,
+            preserve_candidate_vertical=self._altitude_hold,
         ))
         # Phase 16A/B: the geofence comes from the mission map (same numbers as the legacy
         # hand-built GeofenceSpec: centred on the origin, half extent arena_size / 2). The map's
@@ -778,6 +801,13 @@ class FloodSearchMission:
                 self._min_ground_truth_obstacle_clearance_m, float(np.min(true_obstacle_edge_dists)),
             )
 
+    def _with_altitude_command(self, i, desired_vel, own_state, dt):
+        """Phase 16C: put the outer altitude loop's vertical speed into the candidate. Reads only this drone's
+        own VehicleState (its estimated altitude), never the physics state."""
+        out = np.array(desired_vel, dtype=float)
+        out[2] = self.vertical.command(i, self.cfg.flight_altitude, own_state.position_m[2], dt)
+        return out
+
     def _drone_has_contact_now(self, i: int) -> bool:
         """Evaluation-only input to the Phase 4 safety supervisor: is
         drone i touching anything (another drone, an obstacle, the
@@ -919,7 +949,7 @@ class FloodSearchMission:
             # lower-indexed one - a documented, simple choice, not both).
             safety_ctx = tick_safety_context.get(drone_ids_involved[0], {}) if drone_ids_involved else {}
 
-            self.diagnostics.classify_contact(
+            event = self.diagnostics.classify_contact(
                 t=t, body_a=body_a, body_b=body_b, drone_id_set=self._drone_id_set,
                 obstacle_body_ids=self._obstacle_body_ids,
                 estimated_clearance_m=estimated_clearance_m, actual_clearance_m=actual_clearance_m,
@@ -932,6 +962,7 @@ class FloodSearchMission:
                 previous_command_velocity_mps=safety_ctx.get("previous_command_velocity_mps"),
                 current_command_velocity_mps=safety_ctx.get("current_command_velocity_mps"),
             )
+            self.flight_scorer.record_contact(t, event.category, drone_ids_involved, event.altitude_m)
 
     def _update_drone_labels(self, positions):
         """Floating 'D{i}' label above each drone, updated in place each step
@@ -1054,8 +1085,12 @@ class FloodSearchMission:
                 desired_vel = self.controller.step(
                     i, own_state, sensor_obs, neighbor_obs, self.board, self.network,
                 )
+                if self._altitude_hold:
+                    # Phase 16C: the outer altitude loop, on this drone's OWN estimated altitude only.
+                    desired_vel = self._with_altitude_command(i, desired_vel, own_state, dt)
 
                 safe_vel = desired_vel
+                supervisor_hold = False     # True when the supervisor asked for no motion (HOLD/LAND/ABORT/rejected)
                 if cfg.safety_enabled:
                     candidate = CandidateCommand(
                         vehicle_id=f"drone{i}", desired_velocity_mps=tuple(float(v) for v in desired_vel),
@@ -1091,9 +1126,11 @@ class FloodSearchMission:
                             # descent-rate concept - see docs/PHASE4_SAFETY.md's
                             # "Assumptions") can actually realize.
                             safe_vel = np.zeros(3)
+                            supervisor_hold = True
                     else:
                         self._safety_rejected_count += 1
                         safe_vel = np.zeros(3)
+                        supervisor_hold = True
 
                     # Phase 4.1 required investigation item 2: per-tick
                     # safety-transition telemetry, plus the bookkeeping
@@ -1153,29 +1190,23 @@ class FloodSearchMission:
                 # plant-side autopilot/physics move it in the true frame (see _to_plant_frame).
                 # Rotation preserves the speed cap, so mapping after the governor is exact.
                 target_vel = self._to_plant_frame(target_vel, view, i)
-                # Anchor altitude via real position feedback (z held at flight_altitude);
-                # x/y are left to pure velocity tracking so the swarm behavior drives motion.
-                # Yaw is held at a fixed setpoint (0) rather than "current yaw" - the latter
-                # gives zero yaw error every step, i.e. no restoring torque, which lets any
-                # residual spin (excited by continuously-curving swarm paths) run away freely.
-                # Altitude is otherwise held at a fixed cruise setpoint (see
-                # comment above) - the one exception is a nonzero z from the
-                # safety supervisor's own filtered command (altitude floor/
-                # ceiling correction, see safety_supervisor.py's
-                # _evaluate_altitude), integrated one step and clamped
-                # inside the geofence's floor/ceiling.
-                target_z = cfg.flight_altitude
-                if cfg.safety_enabled and abs(safe_vel[2]) > 1e-9:
-                    target_z = float(np.clip(truth.positions[i, 2] + safe_vel[2] * dt,
-                                              self._geofence.floor_alt_m, self._geofence.ceiling_alt_m))
-                target_pos = np.array([truth.positions[i, 0], truth.positions[i, 1], target_z])
-                rpm_action[i], _, _ = self.pid[i].computeControlFromState(
-                    control_timestep=self.env.CTRL_TIMESTEP,
-                    state=obs[i],
-                    target_pos=target_pos,
-                    target_rpy=np.array([0.0, 0.0, 0.0]),
-                    target_vel=target_vel,
+                if self._altitude_hold and supervisor_hold:
+                    # A supervisor HOLD / LAND / ABORT or a rejected command means "no horizontal motion". The
+                    # altitude loop keeps running: without it a drone braked into a hold keeps whatever altitude
+                    # sag the braking transient caused, indefinitely (found by the 16C gate, see the doc).
+                    target_vel[2] = desired_vel[2]
+                # Plant side (swarm_sim/plant_actuator.py): the simulated autopilot turns the velocity
+                # setpoint into motor speeds using TRUE state. x/y are pure velocity tracking so the swarm
+                # behaviour drives motion; yaw is held at a fixed setpoint (0) rather than "current yaw" -
+                # the latter gives zero yaw error every step, i.e. no restoring torque, which lets any
+                # residual spin (excited by continuously-curving swarm paths) run away freely. Altitude:
+                # in "legacy" mode the cruise setpoint, re-anchored to true z whenever the safety layer
+                # asks for vertical motion; in "altitude_hold" mode pure velocity tracking closed by the
+                # outer altitude loop above.
+                rpm_action[i] = self.autopilot.rpm(
+                    i, obs[i], truth.positions[i], target_vel, safe_vel[2], dt, self.env.CTRL_TIMESTEP,
                 )
+                self.flight_scorer.record_tick(t, i, truth.positions[i][2], truth.rpys[i][:2])
                 mode = "recruit" if self.controller.committed_beacon[i] is not None else "search"
                 num_neighbors = len(self.network.neighbor_table(i, cfg.comm_max_age_steps))
                 self.telemetry.record(t, i, truth.positions[i], truth.velocities[i], truth.rpys[i],
@@ -1314,4 +1345,7 @@ class FloodSearchMission:
             "true_geofence": self._geofence_scorer.summary(),
             "mission_map_id": self._mission_map.map_id,
             "synthetic_beacon_count": self._synthetic_beacon_count,
+            # Phase 16C - see docs/PHASE16C_FLIGHT_LIFECYCLE.md. Scoring only (true altitude, contact root cause).
+            "flight_control_mode": cfg.flight_control_mode,
+            "flight": self.flight_scorer.summary(),
         }

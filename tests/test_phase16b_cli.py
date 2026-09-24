@@ -33,3 +33,11 @@ def test_unknown_localization_or_profile_is_rejected():
 def test_numeric_flags_parse():
     args = _parse("--estimator-noise-scale", "0.3", "--geofence-sigma-k", "3")
     assert args.estimator_noise_scale == 0.3 and args.geofence_sigma_k == 3.0
+
+
+def test_flight_control_flag_defaults_to_legacy_and_accepts_altitude_hold():
+    """Phase 16C."""
+    assert _parse().flight_control == "legacy"
+    assert _parse("--flight-control", "altitude_hold").flight_control == "altitude_hold"
+    with pytest.raises(SystemExit):
+        _parse("--flight-control", "autopilot")

@@ -288,6 +288,9 @@ protection must have priority over horizontal escape when necessary".
 escape command's z-component is exactly 0.0 - not "don't care about
 vertical", but an explicit "hold zero vertical velocity" target that,
 after fix 1 above, is no longer starved by a large horizontal delta.
+(Phase 16C-1 supersedes this behind `flight_control_mode="altitude_hold"`: a real outer altitude loop on the
+drone's own estimated altitude, and a candidate-path vertical bound that no longer depends on the measured
+vertical speed - see PHASE16C_FLIGHT_LIFECYCLE.md. The default behaviour described here is unchanged.)
 This is still a simplified stand-in for a real altitude-hold controller:
 it cancels vertical VELOCITY, not any vertical POSITION drift that
 already happened - genuine floor protection is

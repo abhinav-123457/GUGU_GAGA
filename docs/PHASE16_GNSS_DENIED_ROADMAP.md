@@ -1,10 +1,12 @@
 # Phase 16: GNSS-denied swarm SAR - roadmap, requirements traceability, assumptions
 
-**Status: Phase 16A (mission frame + 1x1 m grid) and Phase 16B (estimated
-state, drift, covariance-aware geofence) are built and tested - see
-[PHASE16A_MISSION_FRAME_GRID.md](PHASE16A_MISSION_FRAME_GRID.md) and
-[PHASE16B_ESTIMATION.md](PHASE16B_ESTIMATION.md). Phases 16C-16J are outlines
-only.**
+**Status: Phase 16A (mission frame + 1x1 m grid), Phase 16B (estimated
+state, drift, covariance-aware geofence) and Phase 16C-1 (independent vertical
+control) are built and tested - see
+[PHASE16A_MISSION_FRAME_GRID.md](PHASE16A_MISSION_FRAME_GRID.md),
+[PHASE16B_ESTIMATION.md](PHASE16B_ESTIMATION.md) and
+[PHASE16C_FLIGHT_LIFECYCLE.md](PHASE16C_FLIGHT_LIFECYCLE.md). Phase 16C-2 (flight
+lifecycle, launch-zone takeoff and landing) and 16D-16J are outlines only.**
 
 ## Why this phase exists
 
@@ -65,7 +67,8 @@ operator; the rule numbers are not reproduced here.
 |---|---|
 | **16A** | `MissionArea`, `LaunchZone`, `GridSpec`/`CellIndex`, `mission_rules` - pure data, no existing file touched. **Done.** |
 | **16B** | `EstimatedState`, drift profiles (VIO, optical flow + rangefinder, LiDAR odometry), EKF with covariance, truth-boundary AST tests, `localization_mode` flag defaulting to legacy behaviour. **Done.** |
-| 16C | Per-drone `FlightPhase` state machine (grounded / takeoff / search / deliver / RTH / land / abort), launch-slot spawn, landing, battery drain; **plus a real altitude hold** decoupled from the horizontal safety limiter (16B finding 7: the legacy vertical channel only damps, so estimated-vertical-speed noise random-walks altitude and confounds mission-level results) |
+| **16C-1** | Plant-actuator boundary (`plant_actuator.py`), independent vertical control (`flight/vertical.py`, two supervisor flags), contact root-cause attribution, validation gate G1-G4. `flight_control_mode` defaults to legacy. **Done** - see the 16C doc. |
+| 16C-2 | Per-drone `FlightPhase` state machine (grounded / takeoff / search / RTH / land / abort), ground spawn in the launch-zone slots, landing with in-zone scoring, minimal illustrative battery model that makes the supervisor's LOW_BATTERY / RETURN_TO_SAFE_POINT / LAND_REQUESTED states reachable. `DELIVER` waits for 16G. |
 | 16D | Survivor localisation to cell + sigma; cell-based evidence with origin-drone dedup; covariance-aware consensus gating |
 | 16E | Distributed grid belief (gossip, monotonic status lattice) and distributed task allocation; removes the centralised `RecruitmentBoard` and the omniscient confirmed-id set |
 | 16F | Failsafes under denial: RTH into the 3.66 m zone (needs launch-zone landmark aiding - dead-reckoning alone cannot hit it), comm-loss, low battery, abort, landing-in-zone scoring; cooperative aiding via covariance intersection |
@@ -97,3 +100,5 @@ should be a deliberate decision, recorded here.
 | A10 | In `estimated` mode every consensus confirmation becomes a beacon | `FloodSearchMission._announce_beacon_for_confirmation` | Legacy `truth_state` still gates beacons on ground truth; the two swarms differ by design |
 | A11 | A drone's motion is its estimated-frame command rotated by the heading error only | `FloodSearchMission._to_plant_frame` | Scale and bias errors would perturb real motion by about 1 % more |
 | A12 | The radio reports true link range to the flocking controller | `CommsNetwork.tick` (`dist`) | A real radio's ranging is noisy or absent |
+| A13 | With `independent_vertical_axis` the vertical acceleration limit is applied against the previous commanded vertical speed, reset to 0 on HOLD / LAND / ABORT / rejection | `SafetySupervisor.evaluate`, `_last_cmd_vz` | A real autopilot's own altitude hold is not modelled on a HOLD command |
+| A14 | The plant is an idealised velocity tracker with exact gravity feed-forward, no wind, motor lag or mass error; the outer altitude loop is P-only | `plant_actuator.SimulatedAutopilot`, `flight/vertical.py` | A real velocity loop has bias, which appears as an altitude offset of bias / kp |

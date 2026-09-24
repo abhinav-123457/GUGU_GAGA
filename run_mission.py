@@ -42,6 +42,10 @@ def build_parser():
     parser.add_argument("--geofence-sigma-k", type=float, default=0.0,
                          help="widen the geofence response by k x the drone's own position uncertainty "
                               "(0 = off, the legacy behaviour)")
+    parser.add_argument("--flight-control", choices=["legacy", "altitude_hold"], default="legacy",
+                         help="legacy: the pre-16C vertical channel, which damps but does not hold altitude "
+                              "(default); altitude_hold: an outer altitude loop on the drone's own estimated "
+                              "altitude (Phase 16C, docs/PHASE16C_FLIGHT_LIFECYCLE.md)")
     return parser
 
 
@@ -67,6 +71,7 @@ def main():
         estimator_profile=args.estimator_profile,
         estimator_assumed_noise_scale=args.estimator_noise_scale,
         safety_pose_sigma_geofence_k=args.geofence_sigma_k,
+        flight_control_mode=args.flight_control,
     )
 
     mission = FloodSearchMission(cfg)
@@ -93,6 +98,12 @@ def main():
     geo = result["true_geofence"]
     print(f"  True geofence excursions (scoring only): {geo['ticks_outside']}/{geo['ticks']} drone-ticks outside, "
           f"worst {geo['max_excursion_m']:.2f} m")
+    alt = result["flight"]["altitude"]
+    if alt["samples"]:
+        roots = result["flight"]["contacts"]["first_contact_root_cause_per_drone"]
+        print(f"\nPhase 16C flight control ({result['flight_control_mode']}), true altitude after the first 2 s: "
+              f"std {alt['std_m']:.3f} m, range [{alt['min_m']:.2f}, {alt['max_m']:.2f}] m; first contacts by root cause "
+              f"{roots}")
     loc = result["localization"]
     if loc is not None:
         print(f"\nPhase 16B GNSS-denied localization ({result['estimator_profile']} profile, illustrative drift model):")

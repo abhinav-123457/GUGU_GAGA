@@ -287,6 +287,17 @@ class SafetySupervisorConfig:
     # from) - see evaluate()'s dt_s computation.
     fallback_dt_s: float = 1.0 / 24.0
 
+    # Phase 16C vertical axis (docs/PHASE16C_FLIGHT_LIFECYCLE.md). Both default to the legacy behaviour.
+    # independent_vertical_axis: the mission-candidate path bounds the horizontal acceleration on the horizontal
+    #   delta only, and the vertical axis against the PREVIOUS COMMANDED vertical speed - never against the
+    #   drone's own measured (possibly estimated, noisy) vertical speed. Legacy bounds the combined 3D delta, so
+    #   almost every tick the vertical command is a fraction of the drone's own vertical speed.
+    # preserve_candidate_vertical: separation / obstacle / horizontal-geofence / safe-point overrides keep the
+    #   candidate's vertical speed instead of commanding zero, so horizontal avoidance cannot cancel an altitude
+    #   hold. The altitude floor/ceiling tiers still own the vertical axis.
+    independent_vertical_axis: bool = False
+    preserve_candidate_vertical: bool = False
+
 
 # --------------------------------------------------------------------------
 # Geometry helpers - pure functions, unit-tested directly.
@@ -437,6 +448,11 @@ class SafetySupervisor:
         # construction helpers individually.
         self._current_own_vel = (0.0, 0.0, 0.0)
         self._current_dt_s = 1.0 / 24.0
+        # Phase 16C: the candidate's vertical speed this call, and the vertical speed this module last
+        # commanded per vehicle (the reference the vertical acceleration bound uses when
+        # cfg.independent_vertical_axis is on). Bookkeeping only - unused with both flags off.
+        self._current_candidate_vz = 0.0
+        self._last_cmd_vz: Dict[str, float] = {}
 
     # -- logging ------------------------------------------------------
 
@@ -473,8 +489,14 @@ class SafetySupervisor:
             timestamp_s=now_s, expiration_time_s=now_s + 1.0, source="SafetySupervisor", confidence=1.0,
         )
 
-    def _velocity_command(self, vehicle_id: str, frame: Frame, velocity_mps, now_s: float) -> Command:
+    def _velocity_command(self, vehicle_id: str, frame: Frame, velocity_mps, now_s: float,
+                          own_vertical: bool = False) -> Command:
+        """`own_vertical=True` marks a caller that owns the vertical axis itself (the altitude tiers and the
+        mission-candidate path); every other override keeps the candidate's vertical speed when
+        cfg.preserve_candidate_vertical is on."""
         cfg = self.cfg
+        if cfg.preserve_candidate_vertical and not own_vertical:
+            velocity_mps = (velocity_mps[0], velocity_mps[1], self._current_candidate_vz)
         bounded = bound_velocity_step(self._current_own_vel, tuple(velocity_mps), self._current_dt_s,
                                         cfg.max_accel_mps2, cfg.max_turn_rate_radps, cfg.max_speed_mps)
         return Command(
@@ -517,8 +539,18 @@ class SafetySupervisor:
         dt_s = now_s - self._last_eval_time[vid] if vid in self._last_eval_time else cfg.fallback_dt_s
         dt_s = max(dt_s, 1e-3)
         self._last_eval_time[vid] = now_s
-        self._current_own_vel = own_vel
+        if cfg.independent_vertical_axis:
+            # the vertical axis is bounded against what was last COMMANDED, not what was measured
+            self._current_own_vel = (own_vel[0], own_vel[1], self._last_cmd_vz.get(vid, 0.0))
+        else:
+            self._current_own_vel = own_vel
         self._current_dt_s = dt_s
+        cand_vel = candidate_command.desired_velocity_mps
+        cand_vz = 0.0
+        if (isinstance(cand_vel, tuple) and len(cand_vel) == 3 and isinstance(cand_vel[2], (int, float))
+                and not isinstance(cand_vel[2], bool) and math.isfinite(cand_vel[2])):
+            cand_vz = max(-cfg.max_speed_mps, min(cfg.max_speed_mps, float(cand_vel[2])))
+        self._current_candidate_vz = cand_vz
 
         self._update_position_history(vid, now_s, own_pos)
         self._update_neighbor_last_seen(vid, now_s, neighbor_observations)
@@ -543,6 +575,11 @@ class SafetySupervisor:
                    min_clearance=None, ttc=None, c2c=None, body=None, obstacle=None, geofence_dist=None,
                    uncertainty=None) -> SafetyDecision:
             self._last_state[vid] = state
+            if (accepted and command is not None and command.command_type == CommandType.VELOCITY_SETPOINT
+                    and command.desired_velocity_mps is not None):
+                self._last_cmd_vz[vid] = float(command.desired_velocity_mps[2])
+            else:
+                self._last_cmd_vz[vid] = 0.0        # HOLD / LAND / ABORT / rejected: the mission commands zero
             return SafetyDecision(
                 vehicle_id=vid, sim_time_s=now_s, accepted=accepted, filtered_command=command,
                 active_constraints=tuple(constraints), reason=reason, emergency_state=state,
@@ -829,7 +866,8 @@ class SafetySupervisor:
             reason = f"altitude {z:.2f}m within critical margin {cfg.altitude_critical_margin_m}m of floor {floor}m"
             self._log(vid, now_s, "command_overridden", SafetyState.GEOFENCE_RISK, reason)
             velocity = (0.0, 0.0, cfg.max_speed_mps)
-            return decide(SafetyState.GEOFENCE_RISK, self._velocity_command(vid, frame, velocity, now_s), True,
+            return decide(SafetyState.GEOFENCE_RISK,
+                          self._velocity_command(vid, frame, velocity, now_s, own_vertical=True), True,
                           ["altitude_floor_critical"], reason)
         return None
 
@@ -847,13 +885,15 @@ class SafetySupervisor:
             reason = f"altitude {z:.2f}m within {cfg.altitude_margin_m}m of floor {floor}m"
             self._log(vid, now_s, "command_overridden", SafetyState.GEOFENCE_RISK, reason)
             velocity = (0.0, 0.0, cfg.max_speed_mps * 0.5)
-            return decide(SafetyState.GEOFENCE_RISK, self._velocity_command(vid, frame, velocity, now_s), True,
+            return decide(SafetyState.GEOFENCE_RISK,
+                          self._velocity_command(vid, frame, velocity, now_s, own_vertical=True), True,
                           ["altitude_floor"], reason)
         if z > ceiling - cfg.altitude_margin_m:
             reason = f"altitude {z:.2f}m within {cfg.altitude_margin_m}m of ceiling {ceiling}m"
             self._log(vid, now_s, "command_overridden", SafetyState.GEOFENCE_RISK, reason)
             velocity = (0.0, 0.0, -cfg.max_speed_mps * 0.5)
-            return decide(SafetyState.GEOFENCE_RISK, self._velocity_command(vid, frame, velocity, now_s), True,
+            return decide(SafetyState.GEOFENCE_RISK,
+                          self._velocity_command(vid, frame, velocity, now_s, own_vertical=True), True,
                           ["altitude_ceiling"], reason)
         return None
 
@@ -967,18 +1007,30 @@ class SafetySupervisor:
         # anything changes" lookahead constant, a different quantity (see
         # bound_velocity_step's docstring for why conflating the two was
         # itself a bug this phase found and fixed).
-        own_vel = own_state.velocity_mps
+        own_vel = self._current_own_vel      # == own_state.velocity_mps unless cfg.independent_vertical_axis
         dt_s = self._current_dt_s
         bounded_vel = _clip_speed(vel, cfg.max_speed_mps)
         delta = tuple(b - o for b, o in zip(bounded_vel, own_vel))
-        accel_mag = math.sqrt(sum(d * d for d in delta)) / dt_s
         constraints = []
         if math.hypot(*vel[:2]) > cfg.max_speed_mps + 1e-9:
             constraints.append("speed_limit")
-        if accel_mag > cfg.max_accel_mps2:
-            scale = cfg.max_accel_mps2 / max(accel_mag, 1e-9)
-            bounded_vel = tuple(o + d * scale for o, d in zip(own_vel, delta))
-            constraints.append("accel_limit")
+        if cfg.independent_vertical_axis:
+            # Phase 16C: horizontal and vertical bounded separately, the vertical against the previous command.
+            accel_h = math.hypot(delta[0], delta[1]) / dt_s
+            if accel_h > cfg.max_accel_mps2:
+                scale = cfg.max_accel_mps2 / max(accel_h, 1e-9)
+                bounded_vel = (own_vel[0] + delta[0] * scale, own_vel[1] + delta[1] * scale, bounded_vel[2])
+                constraints.append("accel_limit")
+            if abs(delta[2]) / dt_s > cfg.max_accel_mps2:
+                bounded_vel = (bounded_vel[0], bounded_vel[1],
+                               own_vel[2] + math.copysign(cfg.max_accel_mps2 * dt_s, delta[2]))
+                constraints.append("vertical_accel_limit")
+        else:
+            accel_mag = math.sqrt(sum(d * d for d in delta)) / dt_s
+            if accel_mag > cfg.max_accel_mps2:
+                scale = cfg.max_accel_mps2 / max(accel_mag, 1e-9)
+                bounded_vel = tuple(o + d * scale for o, d in zip(own_vel, delta))
+                constraints.append("accel_limit")
         own_speed = math.hypot(own_vel[0], own_vel[1])
         new_speed = math.hypot(bounded_vel[0], bounded_vel[1])
         if own_speed > 1e-6 and new_speed > 1e-6:
@@ -996,7 +1048,7 @@ class SafetySupervisor:
         if sensor_observation.dropout:
             constraints.append("sensor_dropout")
             reason += " (sensor dropout this tick - degraded, not blocked)"
-        command = self._velocity_command(vid, frame, bounded_vel, now_s)
+        command = self._velocity_command(vid, frame, bounded_vel, now_s, own_vertical=True)
         if not constraints or constraints == ["sensor_dropout"]:
             self._last_state[vid] = state
         else:

@@ -226,6 +226,20 @@ class MissionConfig:
     est_command_frame_mapping: bool = True            # rotate estimated-frame commands into the true frame
                                                        # before the plant-side autopilot (False = ablation)
 
+    # Phase 16C: vertical control (swarm_sim/flight/, swarm_sim/plant_actuator.py, docs/PHASE16C_FLIGHT_LIFECYCLE.md).
+    # "legacy" (default) is the pre-16C pipeline, bit-for-bit: altitude is only damped (the supervisor's vertical
+    # command is a fraction of the drone's own vertical speed and the plant re-anchors its altitude setpoint to the
+    # true z whenever that command is non-zero). "altitude_hold" closes an outer altitude loop on the drone's own
+    # ESTIMATED z, bounds the vertical axis independently of the horizontal one in the supervisor, and lets the
+    # plant track velocity in all three axes. The gains are illustrative, not hardware-verified.
+    flight_control_mode: str = "legacy"               # "legacy" | "altitude_hold"
+    altitude_kp_per_s: float = 1.0                    # vz* = kp * (z_target - z_estimate)
+    altitude_max_climb_mps: float = 1.5
+    altitude_max_descent_mps: float = 1.0
+    altitude_slew_mps2: float = 1.0                   # limit on the change of vz* per second
+    autopilot_max_accel_mps2: float = 4.0             # altitude_hold only: the simulated autopilot's own limit on how fast
+                                                       # its velocity setpoint may change (horizontal and vertical apart)
+
     # Simulation
     duration_sec: float = 90.0
     control_freq_hz: int = 24

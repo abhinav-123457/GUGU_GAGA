@@ -260,6 +260,10 @@ It is unit-tested here and **not wired into the mission until 16F**.
    (0-0.05 m/s, see the profile note above). In 14 s missions the true altitude
    standard deviation is 0.05-0.09 m in `truth_state`, 0.06-0.10 m in `ideal`,
    0.27-0.39 m in `flow_rf` with the new density and 0.45-1.7 m with the old one.
+   *Phase 16C addendum:* a root-cause split of the legacy ground-first contacts over 12 seeds
+   (see `PHASE16C_FLIGHT_LIFECYCLE.md`, finding 5) shows two mechanisms, not one: upright drones
+   sinking (the mechanism traced above) and tumbles after an abrupt stop from speed. With the shipped
+   noise `flow_rf` had 3 upright ground strikes and 1 tumble, `stress` 10 and 22.
    *What this does not fix:* the vertical channel is still open-loop against
    noise, only a small noise density keeps it benign, and a `truth_state`
    ground contact (seed 2, 21 s, floor response) shows the legacy pipeline has
