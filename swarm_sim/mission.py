@@ -21,8 +21,10 @@ but past this file, it goes one of exactly two ways:
      controller decision.
 See docs/PHASE2_SENSING.md for the full model.
 """
+import dataclasses
 import math
 import time as timemod
+from typing import List, Optional
 
 import numpy as np
 import pybullet as p
@@ -41,16 +43,21 @@ from .autopilot import VehicleTelemetry as AutopilotVehicleTelemetry
 from .autopilot.ardupilot_sitl import build_ardupilot_sitl_adapter
 from .autopilot.sitl import SITLAdapter
 from .consensus import ConsensusBoard
-from .contracts import CommandType, Frame, GeofenceSpec, HealthState, SensorObservation, VehicleState
+from .contracts import CommandType, Frame, HealthState, SensorObservation, VehicleState
 from .controller import SwarmController
 from .diagnostics import MissionDiagnostics
+from .estimation import EstimatedState, StateEstimator, get_profile, pose_uncertainty_m, to_vehicle_state
+from .estimation.metrics import GeofenceExcursionScorer, LocalizationScorer
+from .estimation.plant_odometry import OdometrySuite
+from .mapping import MissionMap
 from .network import CommsNetwork
+from .plant_truth import PlantTruth
 from .recruitment import RecruitmentBoard
 from .safety_supervisor import (
     TIER_MISSION_CANDIDATE, CandidateCommand, MissionContext, SafetySupervisor, SafetySupervisorConfig, tier_of,
 )
 from .seeding import SeedManager
-from .sensors import NeighborSensorModel, ObstacleRangeSensor, VictimSensorModel
+from .sensors import NeighborSensorModel, ObstacleRangeSensor, VictimSensorModel, rotate_xy
 from .sitl import FakeSITLTransport
 from .sitl.ardupilot_transport import ArduPilotSITLTransport, ArduPilotVehicleEndpoint, parse_connection_string
 from .speed_control import SpeedController
@@ -88,9 +95,44 @@ def _dedupe_contacts_by_pair(contacts):
     return seen
 
 
+@dataclasses.dataclass
+class _AutonomyView:
+    """What the drones BELIEVE about themselves this tick - the only pose
+    the autonomy stack (controller, safety supervisor, recruitment,
+    consensus, the radio payload) ever sees. Built by
+    FloodSearchMission._autonomy_view(), the one place ground truth is turned
+    into it: in `truth_state` mode it simply aliases the physics arrays (the
+    legacy perfect-state pipeline, unchanged); in `estimated` mode it is each
+    drone's own dead-reckoned estimate. `yaw_errors` is estimated minus true
+    heading, used ONLY to place body-relative sensor measurements into the
+    drone's own frame (see sensors.py) and to map its commands back out."""
+    positions: np.ndarray                 # (N, 3)
+    velocities: np.ndarray                # (N, 3)
+    attitudes: np.ndarray                 # (N, 3) roll, pitch, yaw
+    states: Optional[List[EstimatedState]]
+    yaw_errors: Optional[np.ndarray]      # (N,) rad, or None in truth_state mode
+
+    def own_est_xy(self, i):
+        return None if self.states is None else self.positions[i, :2]
+
+    def yaw_error(self, i) -> float:
+        return 0.0 if self.yaw_errors is None else float(self.yaw_errors[i])
+
+    def pose_sigma(self, i) -> float:
+        return 0.0 if self.states is None else pose_uncertainty_m(self.states[i])
+
+
+def _wrap_angle(a):
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
 class FloodSearchMission:
     def __init__(self, config):
         self.cfg = config
+        if config.localization_mode not in ("truth_state", "estimated"):
+            raise ValueError(
+                f"localization_mode must be 'truth_state' or 'estimated', got {config.localization_mode!r}"
+            )
         self.rng = np.random.default_rng(config.seed)
         self.telemetry = TelemetryHub()
         self.board = RecruitmentBoard(decay_rate=config.beacon_decay_rate)
@@ -164,10 +206,18 @@ class FloodSearchMission:
             battery_critical_fraction=config.safety_battery_critical_fraction,
             link_timeout_s=config.safety_link_timeout_s,
             lost_agent_timeout_s=config.safety_lost_agent_timeout_s,
+            pose_sigma_geofence_k=config.safety_pose_sigma_geofence_k,
+            pose_sigma_cap_m=config.safety_pose_sigma_cap_m,
         ))
-        self._geofence = GeofenceSpec(
-            frame=Frame.LOCAL_ENU, center_m=(0.0, 0.0), half_extents_m=(half, half),
-            floor_alt_m=config.safety_altitude_floor_m, ceiling_alt_m=config.safety_altitude_ceiling_m,
+        # Phase 16A/B: the geofence comes from the mission map (same numbers as the legacy
+        # hand-built GeofenceSpec: centred on the origin, half extent arena_size / 2). The map's
+        # zone/grid checks are relaxed here because 16B does not yet spawn from the launch zone
+        # or report by grid cell; 16C tightens both.
+        self._mission_map = MissionMap.centered_square(
+            config.arena_size, allow_partial_cells=True, allow_zone_outside_area=True,
+        )
+        self._geofence = self._mission_map.to_geofence(
+            config.safety_altitude_floor_m, config.safety_altitude_ceiling_m,
         )
         self.operator_abort = False   # tests/scenarios may set this directly to model an operator-triggered abort
         self._safety_candidate_count = 0
@@ -202,6 +252,34 @@ class FloodSearchMission:
         self.neighbor_sensor = NeighborSensorModel(
             config, config.num_drones, self._sensor_seeds.rng("neighbor_sensor"),
         )
+
+        # Phase 16B: GNSS-denied localisation. Only built in "estimated" mode, so the legacy
+        # pipeline constructs, draws and computes nothing new. Each drone starts knowing its own
+        # spawn pose only to the profile's launch-slot accuracy (plant-side draw); from then on
+        # it dead-reckons. Odometry error streams are named "odometry/<sensor>/drone<i>" on the
+        # same SeedManager, so they cannot perturb any existing stream.
+        self._geofence_scorer = GeofenceExcursionScorer(config.num_drones, self._geofence)
+        self._odometry = None
+        self._estimators = None
+        self._localization_scorer = None
+        self._estimator_profile_name = None
+        self._synthetic_beacon_count = 0
+        if config.localization_mode == "estimated":
+            profile = get_profile(config.estimator_profile).with_assumed_noise_scale(
+                config.estimator_assumed_noise_scale)
+            if config.estimator_init_pos_sigma_m is not None:
+                profile = profile.with_init_pos_sigma(config.estimator_init_pos_sigma_m)
+            self._estimator_profile_name = profile.name
+            self._odometry = OdometrySuite(profile, config.num_drones, self._sensor_seeds)
+            self._estimators = []
+            for i in range(config.num_drones):
+                dx, dy, dyaw = self._odometry.initial_offsets(i)
+                self._odometry.start(i, init_xyz[i], 0.0)
+                self._estimators.append(StateEstimator(
+                    self._drone_ids[i], profile,
+                    (init_xyz[i, 0] + dx, init_xyz[i, 1] + dy, init_xyz[i, 2]), dyaw,
+                ))
+            self._localization_scorer = LocalizationScorer(config.num_drones, self._mission_map.grid)
 
         # Phase 5: peer-local distributed consensus (swarm_sim/distributed_consensus.py).
         # Its own message-dropout RNG stream is deliberately separate from
@@ -433,7 +511,72 @@ class FloodSearchMission:
                 best_vid, best_d = vid, d
         return best_vid
 
-    def _classify_detections_for_scoring(self, drone_xy, heading_xy, detections, already_found_mask):
+    def _announce_beacon_for_confirmation(self, vid, centroid, first_drone_idx, t):
+        """Turn a consensus confirmation into a recruitment beacon.
+
+        `truth_state` (legacy): only a confirmation that matches a real victim
+        (`vid` from the scoring-only `_match_victim`) becomes a beacon - the
+        swarm never chases a false positive. That gate reads ground truth and
+        is kept only to leave the legacy pipeline bit-for-bit unchanged.
+        `estimated`: every confirmation becomes a beacon, because a drone
+        cannot know whether its consensus is a real victim; `vid` is then only
+        an id label (a synthetic negative id when nothing matches), never a
+        decision."""
+        if vid is None:
+            if self._estimators is None:
+                return
+            self._synthetic_beacon_count += 1
+            vid = -self._synthetic_beacon_count
+        self.board.announce(vid, [centroid[0], centroid[1], self.cfg.flight_altitude], first_drone_idx, t)
+
+    def _autonomy_view(self, truth: PlantTruth, dt: float) -> _AutonomyView:
+        """PLANT-SIDE BRIDGE: the one place ground truth becomes the drones'
+        belief about themselves. `truth_state`: an alias of the physics
+        arrays (legacy). `estimated`: each drone's own odometry-driven
+        estimate - the plant-side odometry models see truth, the estimators
+        never do. Everything the autonomy stack reads about own pose comes
+        out of the returned view."""
+        if self._estimators is None:
+            return _AutonomyView(truth.positions, truth.velocities, truth.rpys, None, None)
+        n = self.cfg.num_drones
+        states = [self._estimators[i].step(self._odometry.measure(i, truth, dt)) for i in range(n)]
+        yaw_errors = np.array([_wrap_angle(states[i].attitude_rad[2] - float(truth.rpys[i, 2])) for i in range(n)])
+        return _AutonomyView(
+            positions=np.array([s.position_m for s in states], dtype=float),
+            velocities=np.array([s.velocity_mps for s in states], dtype=float),
+            attitudes=np.array([s.attitude_rad for s in states], dtype=float),
+            states=states, yaw_errors=yaw_errors,
+        )
+
+    def _score_localization(self, view: _AutonomyView, truth: PlantTruth):
+        """SCORING ONLY: compare every drone's estimate with the real pose, and
+        check the real pose against the geofence (both modes)."""
+        for i in range(self.cfg.num_drones):
+            self._geofence_scorer.record(i, truth.positions[i])
+        if view.states is None:
+            return
+        for i, state in enumerate(view.states):
+            self._localization_scorer.record(i, state, truth.positions[i], float(truth.rpys[i, 2]))
+
+    def _to_plant_frame(self, vec, view: _AutonomyView, i):
+        """Map a vector from drone i's own (estimated) frame into the true
+        frame: v_true = R(true_yaw - estimated_yaw) v_est. A real autopilot
+        closes its velocity loop on its own estimated velocity, so the
+        motion that actually happens is the commanded one rotated by the
+        heading error - which is how localisation drift bends the real
+        flight path. Also used to point the (body-fixed) sensors along the
+        drone's real facing direction. Identity in `truth_state` mode and
+        when `est_command_frame_mapping` is off. Models heading error only:
+        scale-factor and bias errors are not fed back into the true motion."""
+        if not self.cfg.est_command_frame_mapping:
+            return vec
+        angle = view.yaw_error(i)
+        if angle == 0.0:
+            return vec
+        return rotate_xy(vec, -angle)
+
+    def _classify_detections_for_scoring(self, drone_xy, heading_xy, detections, already_found_mask,
+                                         own_est_xy=None, yaw_error_rad=0.0):
         """SCORING ONLY - reads ground truth to label this tick's already-
         sensed detections as matching a real victim or not, and to count
         missed-detection opportunities, for the scenario report. Reuses
@@ -447,7 +590,14 @@ class FloodSearchMission:
         order as `detections`, so the caller can attribute each
         already-submitted consensus report to a victim (or None) for the
         Phase 2 diagnostic report without this function recomputing or
-        re-triggering anything."""
+        re-triggering anything.
+
+        Phase 16B: in `estimated` mode each candidate is expressed in the
+        reporting drone's own (drifting) frame; `own_est_xy` / `yaw_error_rad`
+        let this scoring code undo that placement (the exact inverse of
+        sensors.VictimSensorModel.sense) so a detection is labelled by what
+        the SENSOR saw, not by how far the drone had drifted. Drift itself is
+        scored separately by estimation.metrics.LocalizationScorer."""
         cfg = self.cfg
         # Floored so this doesn't degenerate to a zero-radius window (and
         # therefore reject even an exact, noise-free match) when
@@ -458,6 +608,8 @@ class FloodSearchMission:
         matched_vids_for_candidates = []
         for candidate in detections:
             cand_xy = np.array(candidate.position_m)
+            if own_est_xy is not None:
+                cand_xy = np.asarray(drone_xy, dtype=float) + rotate_xy(cand_xy - own_est_xy, -yaw_error_rad)
             best_vid, best_d = None, match_radius
             for vid, victim_xy in enumerate(self.victims):
                 d = float(np.linalg.norm(victim_xy - cand_xy))
@@ -500,7 +652,7 @@ class FloodSearchMission:
         for candidate in detections:
             self.consensus.submit(drone_id, np.array(candidate.position_m), t)
 
-    def _submit_detections_distributed(self, drone_id, detections, t, positions):
+    def _submit_detections_distributed(self, drone_id, detections, t, positions=None):
         """Phase 5 equivalent of _submit_detections: this drone's sensed
         candidates (still never ground truth - same VictimSensorModel
         output) go into ONLY its own private DroneConsensusNode, then get
@@ -516,7 +668,7 @@ class FloodSearchMission:
             if relay_msg is not None:
                 self.network.send_message(drone_id, relay_msg, positions)
 
-    def _resolve_confirmed_detections_distributed(self, t, positions):
+    def _resolve_confirmed_detections_distributed(self, t, positions=None):
         """Phase 5 equivalent of _resolve_confirmed_detections: drains
         every drone's own local quorum check (already deduplicated
         globally by DistributedConsensus.try_confirm_all - several drones
@@ -534,9 +686,9 @@ class FloodSearchMission:
             centroid = np.array(result.centroid_m)
             vid = self._match_victim(centroid)
             first_drone_idx = self._drone_index[result.contributing_drone_ids[0]]
+            self._announce_beacon_for_confirmation(vid, centroid, first_drone_idx, t)
             if vid is not None:
                 self.victims_found.add(vid)
-                self.board.announce(vid, [centroid[0], centroid[1], self.cfg.flight_altitude], first_drone_idx, t)
                 if self.cfg.gui and vid < len(self._victim_bodies):
                     p.changeVisualShape(self._victim_bodies[vid], -1, rgbaColor=[0.25, 0.85, 0.55, 1], physicsClientId=client)
                 self.diagnostics.record_confirmation(vid, centroid, t, len(result.contributing_drone_ids))
@@ -574,9 +726,9 @@ class FloodSearchMission:
         while result is not None:
             centroid, drones = result
             vid = self._match_victim(centroid)
+            self._announce_beacon_for_confirmation(vid, centroid, min(drones), t)
             if vid is not None:
                 self.victims_found.add(vid)
-                self.board.announce(vid, [centroid[0], centroid[1], self.cfg.flight_altitude], min(drones), t)
                 if self.cfg.gui and vid < len(self._victim_bodies):
                     p.changeVisualShape(self._victim_bodies[vid], -1, rgbaColor=[0.25, 0.85, 0.55, 1], physicsClientId=client)
                 self.diagnostics.record_confirmation(vid, centroid, t, len(drones))
@@ -585,7 +737,7 @@ class FloodSearchMission:
                 self.diagnostics.record_false_confirmation(len(drones))
             result = self.consensus.try_confirm(t)
 
-    def _track_clearance_and_contacts(self, i, positions, neighbor_obs, range_returns):
+    def _track_clearance_and_contacts(self, i, positions, neighbor_obs, range_returns, belief_positions=None):
         """SCORING ONLY. Several deliberately separate clearance metrics
         (docs/PHASE2_DIAGNOSTICS.md has the full breakdown):
         - center-to-center, estimated (from this drone's own sensed
@@ -596,11 +748,17 @@ class FloodSearchMission:
           scan) vs actual (ground truth obstacle centers)
         None of this is fed back into any decision - see
         SwarmController.step(), which never receives ground truth or this
-        method's output."""
+        method's output.
+
+        `belief_positions` (Phase 16B) is what the drones believe their own
+        positions are; the SENSED clearance compares a neighbour reading with
+        the observer's own belief (both in the observer's frame), while the
+        ACTUAL clearance always uses ground truth."""
         cfg = self.cfg
+        own_belief = positions if belief_positions is None else belief_positions
         if neighbor_obs:
             sensed_center = min(
-                float(np.linalg.norm(positions[i] - np.array(n.measured_position_m))) for n in neighbor_obs
+                float(np.linalg.norm(own_belief[i] - np.array(n.measured_position_m))) for n in neighbor_obs
             )
             self._min_sensor_observed_clearance_m = min(self._min_sensor_observed_clearance_m, sensed_center)
 
@@ -688,7 +846,7 @@ class FloodSearchMission:
         return vel
 
     def _classify_and_log_contacts(self, t, positions, velocities, tick_neighbor_obs, tick_range_returns,
-                                     tick_safety_context):
+                                     tick_safety_context, belief_positions=None):
         """SCORING/EVALUATION ONLY. Classifies every PyBullet-verified
         physical contact this tick involving a drone, correlating it with
         each involved drone's own sensing state at that same tick.
@@ -736,8 +894,9 @@ class FloodSearchMission:
                     match = next((n for n in tick_neighbor_obs.get(observer, ())
                                   if n.sender_id == f"drone{other}"), None)
                     if match is not None:
+                        own_belief = positions if belief_positions is None else belief_positions
                         estimated_clearance_m = float(np.linalg.norm(
-                            positions[observer] - np.array(match.measured_position_m)))
+                            own_belief[observer] - np.array(match.measured_position_m)))
                         sensor_age_s = match.packet_age_s
                         stale_or_dropout = match.stale
                         break
@@ -801,19 +960,26 @@ class FloodSearchMission:
             t = step / cfg.control_freq_hz
             obs, _, _, _, _ = self.env.step(rpm_action)
 
-            # Ground truth from here to the sensor-model calls below is fed
-            # ONLY into: (a) the sensor models (their explicitly-permitted
-            # hidden-plant input), (b) CommsNetwork (already comms-realistic,
-            # unchanged since before Phase 2), and (c) scoring/telemetry.
-            # SwarmController.step() below never receives `positions` or
-            # `velocities` directly.
-            positions = obs[:, 0:3]
-            rpys = obs[:, 7:10]
-            velocities = obs[:, 10:13]
+            # Ground truth (`truth`) from here on is fed ONLY into: (a) the plant-side
+            # sensor / odometry models (their explicitly-permitted hidden-plant input),
+            # (b) CommsNetwork's physical link geometry, (c) the PID/plant, and
+            # (d) scoring/telemetry. Everything the autonomy stack reads about its own
+            # pose comes from `view` - the drones' BELIEF, built by _autonomy_view():
+            # the physics arrays themselves in `truth_state` mode (legacy), each drone's
+            # own drifting estimate in `estimated` mode. tests/test_phase16b_architecture.py
+            # enforces this split with an AST check over this very method.
+            truth = PlantTruth(t=t, positions=obs[:, 0:3], velocities=obs[:, 10:13], rpys=obs[:, 7:10])
+            view = self._autonomy_view(truth, dt)
+            self._score_localization(view, truth)
+            plant_headings = np.array([self._to_plant_frame(h, view, k)
+                                       for k, h in enumerate(self.controller.headings)])
 
-            self.network.tick(positions, velocities)
-            self.neighbor_sensor.tick(positions, velocities, self.controller.headings)
-            self.board.service_check(positions, arrival_radius=cfg.arrival_radius)
+            self.network.tick(truth.positions, truth.velocities,
+                              payload_positions=view.positions, payload_velocities=view.velocities)
+            self.neighbor_sensor.tick(truth.positions, truth.velocities, plant_headings,
+                                      own_estimated_positions=None if view.states is None else view.positions,
+                                      own_yaw_errors=view.yaw_errors)
+            self.board.service_check(view.positions, arrival_radius=cfg.arrival_radius)
             self.board.decay(dt)
 
             comp_sizes = self.network.connected_component_sizes(cfg.comm_max_age_steps)
@@ -831,23 +997,28 @@ class FloodSearchMission:
 
             for i in range(cfg.num_drones):
                 heading_xy = self.controller.headings[i][:2].copy()
+                plant_heading_xy = self._to_plant_frame(heading_xy, view, i)
 
-                own_state = VehicleState(
-                    vehicle_id=f"drone{i}", sim_time_s=t, frame=Frame.LOCAL_ENU,
-                    position_m=tuple(float(x) for x in positions[i]),
-                    velocity_mps=tuple(float(x) for x in velocities[i]),
-                    acceleration_mps2=(0.0, 0.0, 0.0),
-                    attitude_rad=tuple(float(x) for x in rpys[i]),
-                    angular_velocity_radps=(0.0, 0.0, 0.0),
-                    battery_fraction=1.0, health_state=HealthState.OK,
-                    estimator_valid=True, last_valid_command_time_s=t,
-                )
+                if view.states is None:
+                    own_state = VehicleState(
+                        vehicle_id=f"drone{i}", sim_time_s=t, frame=Frame.LOCAL_ENU,
+                        position_m=tuple(float(x) for x in view.positions[i]),
+                        velocity_mps=tuple(float(x) for x in view.velocities[i]),
+                        acceleration_mps2=(0.0, 0.0, 0.0),
+                        attitude_rad=tuple(float(x) for x in view.attitudes[i]),
+                        angular_velocity_radps=(0.0, 0.0, 0.0),
+                        battery_fraction=1.0, health_state=HealthState.OK,
+                        estimator_valid=True, last_valid_command_time_s=t,
+                    )
+                else:
+                    own_state = to_vehicle_state(view.states[i], f"drone{i}", t)
 
                 sensing_t0 = timemod.perf_counter()
                 detections, dropped = self.victim_sensor.sense(
-                    i, positions[i], heading_xy, t, already_found_mask,
+                    i, truth.positions[i], plant_heading_xy, t, already_found_mask,
+                    own_estimated_xy=view.own_est_xy(i), own_yaw_error_rad=view.yaw_error(i),
                 )
-                range_returns = self.obstacle_sensor.scan(i, positions[i, :2], heading_xy)
+                range_returns = self.obstacle_sensor.scan(i, truth.positions[i, :2], plant_heading_xy)
                 sensor_obs = SensorObservation(
                     vehicle_id=f"drone{i}",
                     sensor_timestamp_s=max(0.0, t - cfg.victim_sensor_latency_steps * dt),
@@ -855,7 +1026,7 @@ class FloodSearchMission:
                     fov_deg=cfg.victim_sensor_hfov_deg,
                     range_returns_m=range_returns,
                     occluded=tuple(False for _ in range_returns),
-                    dropout=dropped, pose_uncertainty_m=0.0,
+                    dropout=dropped, pose_uncertainty_m=view.pose_sigma(i),
                     detections=detections,
                 )
                 neighbor_obs = self.neighbor_sensor.observations_for(i, dt)
@@ -864,11 +1035,12 @@ class FloodSearchMission:
                 tick_range_returns[i] = range_returns
 
                 matched_vids_for_candidates = self._classify_detections_for_scoring(
-                    positions[i, :2], heading_xy, detections, already_found_mask,
+                    truth.positions[i, :2], plant_heading_xy, detections, already_found_mask,
+                    own_est_xy=view.own_est_xy(i), yaw_error_rad=view.yaw_error(i),
                 )
                 consensus_t0 = timemod.perf_counter()
                 if cfg.consensus_mode == "distributed":
-                    self._submit_detections_distributed(i, detections, t, positions)
+                    self._submit_detections_distributed(i, detections, t)
                 else:
                     self._submit_detections(i, detections, t)
                 self.diagnostics.consensus_cpu_time_s += timemod.perf_counter() - consensus_t0
@@ -876,7 +1048,8 @@ class FloodSearchMission:
                     self.diagnostics.record_submission(matched_vid)
                 self._detection_latencies_s.extend([sensor_obs.sensor_latency_s] * len(detections))
                 self._neighbor_obs_ages_s.extend(n.packet_age_s for n in neighbor_obs)
-                self._track_clearance_and_contacts(i, positions, neighbor_obs, range_returns)
+                self._track_clearance_and_contacts(i, truth.positions, neighbor_obs, range_returns,
+                                                   belief_positions=view.positions)
 
                 desired_vel = self.controller.step(
                     i, own_state, sensor_obs, neighbor_obs, self.board, self.network,
@@ -946,7 +1119,7 @@ class FloodSearchMission:
                     current_cmd_vel = tuple(float(v) for v in safe_vel)
                     prev_cmd_vel = self._prev_command_velocity.get(i, (0.0, 0.0, 0.0))
                     tick_safety_context[i] = {
-                        "altitude_m": float(positions[i, 2]), "vertical_velocity_mps": float(velocities[i, 2]),
+                        "altitude_m": float(truth.positions[i, 2]), "vertical_velocity_mps": float(truth.velocities[i, 2]),
                         "safety_state": state_name, "active_constraints": decision.active_constraints,
                         "command_source": (decision.filtered_command.source
                                             if decision.filtered_command else "SwarmController_bypass"),
@@ -959,7 +1132,7 @@ class FloodSearchMission:
                         "state_duration_s": t - self._state_since.get(i, t), "override_tier": tier,
                         "commanded_horizontal_velocity_mps": math.hypot(current_cmd_vel[0], current_cmd_vel[1]),
                         "commanded_vertical_velocity_mps": current_cmd_vel[2],
-                        "own_altitude_m": float(positions[i, 2]), "own_vertical_velocity_mps": float(velocities[i, 2]),
+                        "own_altitude_m": float(truth.positions[i, 2]), "own_vertical_velocity_mps": float(truth.velocities[i, 2]),
                         "contact_status": bool(mission_context.contact_detected),
                     })
 
@@ -976,6 +1149,10 @@ class FloodSearchMission:
                         safe_vel = self._send_to_autopilot_adapter(i, own_state, decision.filtered_command, t)
 
                 target_vel, applied_speed = self.speed_ctrl.to_velocity_command(i, safe_vel)
+                # `safe_vel` (and so `target_vel`) is in the drone's own (estimated) frame; the
+                # plant-side autopilot/physics move it in the true frame (see _to_plant_frame).
+                # Rotation preserves the speed cap, so mapping after the governor is exact.
+                target_vel = self._to_plant_frame(target_vel, view, i)
                 # Anchor altitude via real position feedback (z held at flight_altitude);
                 # x/y are left to pure velocity tracking so the swarm behavior drives motion.
                 # Yaw is held at a fixed setpoint (0) rather than "current yaw" - the latter
@@ -989,9 +1166,9 @@ class FloodSearchMission:
                 # inside the geofence's floor/ceiling.
                 target_z = cfg.flight_altitude
                 if cfg.safety_enabled and abs(safe_vel[2]) > 1e-9:
-                    target_z = float(np.clip(positions[i, 2] + safe_vel[2] * dt,
+                    target_z = float(np.clip(truth.positions[i, 2] + safe_vel[2] * dt,
                                               self._geofence.floor_alt_m, self._geofence.ceiling_alt_m))
-                target_pos = np.array([positions[i, 0], positions[i, 1], target_z])
+                target_pos = np.array([truth.positions[i, 0], truth.positions[i, 1], target_z])
                 rpm_action[i], _, _ = self.pid[i].computeControlFromState(
                     control_timestep=self.env.CTRL_TIMESTEP,
                     state=obs[i],
@@ -1001,8 +1178,8 @@ class FloodSearchMission:
                 )
                 mode = "recruit" if self.controller.committed_beacon[i] is not None else "search"
                 num_neighbors = len(self.network.neighbor_table(i, cfg.comm_max_age_steps))
-                self.telemetry.record(t, i, positions[i], velocities[i], rpys[i],
-                                       float(np.linalg.norm(velocities[i])), mode, applied_speed,
+                self.telemetry.record(t, i, truth.positions[i], truth.velocities[i], truth.rpys[i],
+                                       float(np.linalg.norm(truth.velocities[i])), mode, applied_speed,
                                        num_neighbors)
 
             consensus_t0 = timemod.perf_counter()
@@ -1011,17 +1188,18 @@ class FloodSearchMission:
                 for i in range(cfg.num_drones):
                     inbox = self.network.poll_inbox(i)
                     self.distributed_consensus.deliver(self._drone_ids[i], inbox, t)
-                self._resolve_confirmed_detections_distributed(t, positions)
+                self._resolve_confirmed_detections_distributed(t)
             else:
                 self._resolve_confirmed_detections(t)
             self.diagnostics.consensus_cpu_time_s += timemod.perf_counter() - consensus_t0
 
-            self._classify_and_log_contacts(t, positions, velocities, tick_neighbor_obs, tick_range_returns,
-                                              tick_safety_context)
+            self._classify_and_log_contacts(t, truth.positions, truth.velocities, tick_neighbor_obs,
+                                            tick_range_returns, tick_safety_context,
+                                            belief_positions=view.positions)
 
             if cfg.gui:
                 if step % 4 == 0:  # a few times a second is plenty legible, and far gentler on the debug renderer
-                    self._update_drone_labels(positions)
+                    self._update_drone_labels(truth.positions)
                 sync(step, start_wall, self.env.CTRL_TIMESTEP)
 
             if len(self.victims_found) == cfg.num_victims:
@@ -1127,4 +1305,13 @@ class FloodSearchMission:
             "sitl_failure_log_count": (
                 self.sitl_transport.total_failure_log_count() if self.sitl_transport else None
             ),
+            # Phase 16A/B GNSS-denied localisation - see docs/PHASE16B_ESTIMATION.md. `localization`
+            # is estimation.metrics.LocalizationScorer's summary (truth-side scoring, never fed
+            # back into a decision); None in truth_state mode.
+            "localization_mode": cfg.localization_mode,
+            "estimator_profile": self._estimator_profile_name,
+            "localization": (self._localization_scorer.summary() if self._localization_scorer is not None else None),
+            "true_geofence": self._geofence_scorer.summary(),
+            "mission_map_id": self._mission_map.map_id,
+            "synthetic_beacon_count": self._synthetic_beacon_count,
         }

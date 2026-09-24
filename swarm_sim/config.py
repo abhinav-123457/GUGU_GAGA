@@ -160,6 +160,12 @@ class MissionConfig:
     safety_battery_critical_fraction: float = 0.08
     safety_link_timeout_s: float = 1.0
     safety_lost_agent_timeout_s: float = 5.0
+    # Phase 16B covariance-aware geofence: the "approaching the boundary" response triggers at
+    # geofence_margin + min(k * pose_sigma, cap), pose_sigma being the drone's own 1-sigma position
+    # uncertainty. k = 0 (default) is the legacy behaviour, bit-for-bit. The cap stops a large
+    # uncertainty from freezing the whole arena.
+    safety_pose_sigma_geofence_k: float = 0.0
+    safety_pose_sigma_cap_m: float = 3.0
 
     # Phase 6: autopilot adapter boundary (swarm_sim/autopilot/). "direct"
     # is the pre-Phase-6 simulator path (safety-evaluated command straight
@@ -208,6 +214,17 @@ class MissionConfig:
     ardupilot_sitl_startup_timeout_s: float = 30.0
     ardupilot_sitl_heartbeat_timeout_s: float = 5.0
     ardupilot_sitl_ack_timeout_s: float = 3.0
+
+    # Phase 16B: GNSS-denied localisation (swarm_sim/estimation/, docs/PHASE16B_ESTIMATION.md).
+    # "truth_state" (default) is the legacy perfect-state pipeline, unchanged. "estimated" makes every
+    # drone act on its own dead-reckoned EstimatedState (odometry drift + covariance); PyBullet truth
+    # is then used only by the plant-side sensor models and by scoring.
+    localization_mode: str = "truth_state"            # "truth_state" | "estimated"
+    estimator_profile: str = "fused"                  # a key of estimation.profiles.PROFILES
+    estimator_assumed_noise_scale: float = 1.0        # estimator's noise multiplier; < 1 = over-confident
+    estimator_init_pos_sigma_m: Optional[float] = None    # None = the profile's own launch-slot accuracy
+    est_command_frame_mapping: bool = True            # rotate estimated-frame commands into the true frame
+                                                       # before the plant-side autopilot (False = ablation)
 
     # Simulation
     duration_sec: float = 90.0

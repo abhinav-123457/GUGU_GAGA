@@ -41,6 +41,9 @@ class CommsNetwork:
         # Phase 5 generic message queue - see send_message/pump_messages/poll_inbox.
         self._message_inflight = []  # (deliver_step, src, dst, message)
         self._message_inbox = [[] for _ in range(num_drones)]
+        # Phase 16B: the radio's own link geometry (real inter-drone distances) as of the last tick(),
+        # kept so send_message() can gate delivery physically without callers handing it positions.
+        self._link_positions = None
 
     def _dropout_prob(self, dist):
         cfg = self.cfg
@@ -50,14 +53,24 @@ class CommsNetwork:
         frac = dist / r
         return cfg.comm_dropout_base + frac * (cfg.comm_dropout_at_max_range - cfg.comm_dropout_base)
 
-    def tick(self, positions, velocities):
+    def tick(self, positions, velocities, payload_positions=None, payload_velocities=None):
         """One round of broadcast: every drone attempts to send its current
         state to every other drone in range. Each link drops independently
         (probability rising with distance); surviving packets are only
-        visible to the receiver after comm_latency_steps."""
+        visible to the receiver after comm_latency_steps.
+
+        `positions` / `velocities` are the physical (plant) state: they decide
+        WHICH links exist and how lossy they are, exactly as radio propagation
+        does. `payload_positions` / `payload_velocities` (Phase 16B) are what
+        each drone actually transmits about itself - its own estimate. They
+        default to `positions` / `velocities` (the legacy perfect-state
+        behaviour). The stored per-link `dist` is the physical link range."""
         cfg = self.cfg
         cur_step = self.step
         deliver_step = cur_step + cfg.comm_latency_steps
+        self._link_positions = np.array(positions, dtype=float)
+        payload_pos = positions if payload_positions is None else payload_positions
+        payload_vel = velocities if payload_velocities is None else payload_velocities
 
         for src in range(self.n):
             for dst in range(self.n):
@@ -68,7 +81,7 @@ class CommsNetwork:
                     continue
                 if self.rng.random() < self._dropout_prob(dist):
                     continue
-                self._inflight.append((deliver_step, src, dst, positions[src].copy(), velocities[src].copy(), dist))
+                self._inflight.append((deliver_step, src, dst, payload_pos[src].copy(), payload_vel[src].copy(), dist))
 
         still_pending = []
         for deliver_step_msg, src, dst, pos, vel, dist in self._inflight:
@@ -92,16 +105,20 @@ class CommsNetwork:
     # physical model - independent per-link range check + distance-dependent
     # packet loss + fixed latency - applied to an opaque payload instead.
 
-    def send_message(self, src, message, positions):
+    def send_message(self, src, message, positions=None):
         """Queue `message` (any opaque, picklable-ish object - never
         inspected here) for delivery from drone `src` to every other drone
         currently within communication_radius, each independently subject
         to the same range-dependent dropout model tick() uses. `positions`
-        is the tick's already-computed position array (mission.py's own
-        ground truth, passed in exactly like tick()'s own positions
-        argument - this method never reads it for anything but a distance
-        check, and never stores it)."""
+        is the tick's physical position array, used only for the distance
+        check; when omitted (Phase 16B) the link geometry cached by the most
+        recent tick() is used, so callers never have to hand this module
+        ground truth."""
         cfg = self.cfg
+        if positions is None:
+            if self._link_positions is None:
+                raise ValueError("send_message() needs positions, or a prior tick() to take the link geometry from")
+            positions = self._link_positions
         deliver_step = self.step + cfg.comm_latency_steps
         for dst in range(self.n):
             if dst == src:

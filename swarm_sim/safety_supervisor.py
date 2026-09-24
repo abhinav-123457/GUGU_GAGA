@@ -241,6 +241,15 @@ class SafetySupervisorConfig:
 
     # Geofence / altitude.
     geofence_margin_m: float = 2.0
+    # Phase 16B covariance-aware geofence (GNSS-denied): the "approaching the boundary" response
+    # triggers at geofence_margin_m + min(pose_sigma_geofence_k * pose_sigma, pose_sigma_cap_m),
+    # where pose_sigma is SensorObservation.pose_uncertainty_m - the vehicle's own 1-sigma position
+    # uncertainty. The already-outside response is NOT inflated (an estimate that is merely
+    # uncertain is not "outside", and inflating it would pin the vehicle at the boundary forever).
+    # k = 0 is the legacy behaviour exactly. This module still imports nothing from `estimation`:
+    # sigma arrives through the existing observation contract.
+    pose_sigma_geofence_k: float = 0.0
+    pose_sigma_cap_m: float = 3.0
     altitude_margin_m: float = 0.5
     # Phase 4.1: a tighter, separate threshold that ALWAYS preempts
     # separation/obstacle/soft-altitude (checked right after geofence,
@@ -559,13 +568,20 @@ class SafetySupervisor:
                        {"geofence_distance_m": geofence_margin})
             return decide(SafetyState.GEOFENCE_RISK, self._hold_command(vid, frame, now_s), True,
                           ["geofence_boundary"], reason, geofence_dist=geofence_margin)
-        if geofence_margin < cfg.geofence_margin_m:
+        pose_inflation = 0.0
+        if cfg.pose_sigma_geofence_k > 0.0:
+            pose_inflation = min(cfg.pose_sigma_geofence_k * sensor_observation.pose_uncertainty_m,
+                                 cfg.pose_sigma_cap_m)
+        if geofence_margin - pose_inflation < cfg.geofence_margin_m:
             inward = _inward_velocity(own_pos, mission_context.geofence, cfg.max_speed_mps)
             reason = f"within {geofence_margin:.2f}m of the geofence boundary (margin {cfg.geofence_margin_m}m)"
+            if pose_inflation > 0.0:
+                reason += f" plus a {pose_inflation:.2f}m position-uncertainty allowance"
             self._log(vid, now_s, "command_overridden", SafetyState.GEOFENCE_RISK, reason,
                        {"geofence_distance_m": geofence_margin})
             return decide(SafetyState.GEOFENCE_RISK, self._velocity_command(vid, frame, inward, now_s), True,
-                          ["geofence_boundary"], reason, geofence_dist=geofence_margin)
+                          ["geofence_boundary"], reason, geofence_dist=geofence_margin,
+                          uncertainty=pose_inflation if pose_inflation > 0.0 else None)
 
         # --- Priority 2.5 (Phase 4.1): critical altitude floor ------------
         # Always preempts separation/obstacle/soft-altitude, regardless of

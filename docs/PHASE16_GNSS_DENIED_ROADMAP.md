@@ -1,7 +1,10 @@
 # Phase 16: GNSS-denied swarm SAR - roadmap, requirements traceability, assumptions
 
-**Status: Phase 16A (mission frame + 1x1 m grid) built and tested. Phase 16B
-(estimated state) is next. Phases 16C-16J are outlines only.**
+**Status: Phase 16A (mission frame + 1x1 m grid) and Phase 16B (estimated
+state, drift, covariance-aware geofence) are built and tested - see
+[PHASE16A_MISSION_FRAME_GRID.md](PHASE16A_MISSION_FRAME_GRID.md) and
+[PHASE16B_ESTIMATION.md](PHASE16B_ESTIMATION.md). Phases 16C-16J are outlines
+only.**
 
 ## Why this phase exists
 
@@ -43,7 +46,7 @@ operator; the rule numbers are not reproduced here.
 | >= 2 drones as one coordinated system | existing swarm + 16E | existing (centralised parts remain until 16E) |
 | Combined all-up weight <= 25 kg | 16A (`mission_rules.check_fleet_mass`) | constants + check built; only meaningful on declared masses |
 | All drones take off from and land in a 12 ft x 12 ft launch zone | 16A (`LaunchZone`, slots), 16C (lifecycle), 16F (RTH-in-zone) | zone geometry + slots built; flight behaviour not yet |
-| Autonomous search of the mission area | existing `FloodSearchMission` | existing; must run on estimated state (16B) |
+| Autonomous search of the mission area | existing `FloodSearchMission` | existing; runs on estimated state in `localization_mode="estimated"` (16B) |
 | Detect up to ten survivors | 16A (`MAX_SURVIVORS`), 16D | constant only |
 | Autonomously geotag each survivor; show on GCS | 16A (1x1 m cell), 16D (cell + sigma), 16H | cell naming built; geotag pipeline not yet |
 | Divide the map into 1x1 m grid; tag the block a survivor is found in | 16A (`GridSpec`, `cell_id`) | built and tested |
@@ -52,17 +55,17 @@ operator; the rule numbers are not reproduced here.
 | GCS shows status, camera feed, position/estimate, task/area, survivors, kit status, health, progress | 16H | not started |
 | No manual waypoint/path/release/tag/replan during execution | 16H (read-only GCS) + AST test | not started |
 | No external network for coordination or data exchange | existing `CommsNetwork` (local, lossy) + 16E | existing |
-| Stay within mission boundary (geofence) | existing SafetySupervisor + 16B (sigma-aware margin) | 16B |
+| Stay within mission boundary (geofence) | existing SafetySupervisor + 16B (sigma-aware margin) | 16B built: enforced on the drone's own estimate, with an optional covariance-aware margin; true excursions are measured. RTH/abort under denial is 16F |
 | Return-to-Home, comm-loss recovery, low-battery failsafe, mission abort | existing SafetySupervisor states + 16C/16F | partly existing; denial-aware versions in 16F |
-| GPS denied from the start of the mission | 16B (estimator), 16J (GNSS only as an ablation baseline) | 16B |
+| GPS denied from the start of the mission | 16B (estimator), 16J (GNSS only as an ablation baseline) | 16B built: no autonomy module can name GNSS/GPS or read ground truth (AST-enforced); dead-reckoning only, no aiding until 16F |
 
 ## Roadmap
 
 | Phase | Scope |
 |---|---|
 | **16A** | `MissionArea`, `LaunchZone`, `GridSpec`/`CellIndex`, `mission_rules` - pure data, no existing file touched. **Done.** |
-| **16B** | `EstimatedState`, drift profiles (VIO, optical flow + rangefinder, LiDAR odometry), EKF with covariance, truth-boundary AST tests, `localization_mode` flag defaulting to legacy behaviour |
-| 16C | Per-drone `FlightPhase` state machine (grounded / takeoff / search / deliver / RTH / land / abort), launch-slot spawn, landing, battery drain |
+| **16B** | `EstimatedState`, drift profiles (VIO, optical flow + rangefinder, LiDAR odometry), EKF with covariance, truth-boundary AST tests, `localization_mode` flag defaulting to legacy behaviour. **Done.** |
+| 16C | Per-drone `FlightPhase` state machine (grounded / takeoff / search / deliver / RTH / land / abort), launch-slot spawn, landing, battery drain; **plus a real altitude hold** decoupled from the horizontal safety limiter (16B finding 7: the legacy vertical channel only damps, so estimated-vertical-speed noise random-walks altitude and confounds mission-level results) |
 | 16D | Survivor localisation to cell + sigma; cell-based evidence with origin-drone dedup; covariance-aware consensus gating |
 | 16E | Distributed grid belief (gossip, monotonic status lattice) and distributed task allocation; removes the centralised `RecruitmentBoard` and the omniscient confirmed-id set |
 | 16F | Failsafes under denial: RTH into the 3.66 m zone (needs launch-zone landmark aiding - dead-reckoning alone cannot hit it), comm-loss, low battery, abort, landing-in-zone scoring; cooperative aiding via covariance intersection |
@@ -89,3 +92,8 @@ should be a deliberate decision, recorded here.
 | A5 | A cell owns its lower edges; the grid's far edge belongs to the last cell; points within 1e-9 cells of a grid line snap onto it | `GridSpec.cell_of` | Survivors exactly on a line could be assigned to the other cell by an organiser using a different tie rule |
 | A6 | Cell 0,0 is at the area's minimum-x / minimum-y corner; ids are `X<ix>Y<iy>` (zero-padded to 2 digits) | `GridSpec.cell_id` | The organisers' block naming may differ; only a GCS display mapping changes |
 | A7 | The launch zone does not align to cell boundaries (3.6576 m is not a whole number of 1 m cells) | - | None functionally; noted so nobody assumes it does |
+| A8 | Each drone starts knowing its own spawn pose in the mission frame to the profile's launch-slot accuracy | `estimation/profiles.py`, `OdometrySuite.initial_offsets` | If drones cannot be placed that precisely, the initial error is larger |
+| A9 | Odometry error is scale-factor, velocity-bias and yaw-rate-bias random walks plus white noise, dropouts and degenerate ticks; all magnitudes illustrative | `estimation/profiles.py` | Real sensors have other failure modes (loop-closure jumps, tracking loss, map-relative behaviour); numbers are not hardware-verified |
+| A10 | In `estimated` mode every consensus confirmation becomes a beacon | `FloodSearchMission._announce_beacon_for_confirmation` | Legacy `truth_state` still gates beacons on ground truth; the two swarms differ by design |
+| A11 | A drone's motion is its estimated-frame command rotated by the heading error only | `FloodSearchMission._to_plant_frame` | Scale and bias errors would perturb real motion by about 1 % more |
+| A12 | The radio reports true link range to the flocking controller | `CommsNetwork.tick` (`dist`) | A real radio's ranging is noisy or absent |

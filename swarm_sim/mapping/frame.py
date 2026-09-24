@@ -217,14 +217,19 @@ class MissionMap:
 
     @classmethod
     def centered_square(cls, arena_size_m: float, cell_m: float = 1.0,
-                        launch_zone: Optional[LaunchZone] = None) -> "MissionMap":
+                        launch_zone: Optional[LaunchZone] = None, allow_partial_cells: bool = False,
+                        allow_zone_outside_area: bool = False) -> "MissionMap":
         """Square area centred on the origin - the legacy `FloodSearchMission`
         arena (`arena_size / 2` half extent about (0, 0)) - with the launch
-        zone at the origin unless given."""
+        zone at the origin unless given. The two `allow_*` flags relax the
+        strict checks (an arena that is not a whole number of cells; a zone
+        that does not fit) for callers that do not yet use the grid or the
+        zone - the legacy mission accepts any `arena_size`."""
         half = arena_size_m / 2.0
         area = MissionArea(-half, -half, half, half)
         return cls(area=area, launch_zone=launch_zone or LaunchZone(),
-                   grid=GridSpec.from_area(area, cell_m))
+                   grid=GridSpec.from_area(area, cell_m, allow_partial=allow_partial_cells),
+                   allow_zone_outside_area=allow_zone_outside_area)
 
     @classmethod
     def zone_at_corner(cls, width_m: float, height_m: float, corner: str = "sw", cell_m: float = 1.0,

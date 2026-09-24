@@ -71,6 +71,17 @@ def _horizontal_bearing(facing_xy, to_target_xy) -> float:
     return math.acos(cos_angle)
 
 
+def rotate_xy(vec, angle_rad: float) -> np.ndarray:
+    """`vec` (2- or 3-vector) with its x/y components rotated counter-clockwise
+    by `angle_rad`; z (if any) is left alone. Exact identity for angle 0."""
+    out = np.array(vec, dtype=float)
+    c, s = math.cos(angle_rad), math.sin(angle_rad)
+    x, y = out[0], out[1]
+    out[0] = c * x - s * y
+    out[1] = s * x + c * y
+    return out
+
+
 def _segment_min_distance_to_point(p0, p1, c) -> float:
     """Shortest 2D distance from point c to the segment p0-p1."""
     p0, p1, c = np.asarray(p0, float), np.asarray(p1, float), np.asarray(c, float)
@@ -128,15 +139,33 @@ class VictimSensorModel:
         return f"det-{self._id_counter}"
 
     def sense(self, i: int, drone_xyz, heading_xy, t_s: float,
-              already_found_mask) -> Tuple[Tuple[DetectionCandidate, ...], bool]:
+              already_found_mask, own_estimated_xy=None,
+              own_yaw_error_rad: float = 0.0) -> Tuple[Tuple[DetectionCandidate, ...], bool]:
         """One tick's victim-detection observation for drone `i`: returns
         (detections, dropped). `dropped` is True when this tick's whole
         observation was lost (sensor dropout, or still inside the initial
         latency ramp-up) - `detections` is always () in that case, but
         `dropped` is what distinguishes "lost observation" from "sensor
-        worked, genuinely saw nothing" for SensorObservation.dropout."""
+        worked, genuinely saw nothing" for SensorObservation.dropout.
+
+        Phase 16B: a camera measures the victim RELATIVE to the drone, and the
+        drone then places that measurement in the mission frame using its own
+        pose estimate. With `own_estimated_xy` (the drone's estimated x/y) and
+        `own_yaw_error_rad` (estimated minus true heading) given, each
+        reported position is `own_estimated_xy + R(yaw_error) * (relative
+        vector + noise)`, so the drone's localisation error propagates into
+        the geotag exactly as it would on real hardware. With both omitted
+        (the default) the legacy absolute-truth-plus-noise output is
+        unchanged, bit for bit. `drone_xyz` / `heading_xy` are plant-side
+        inputs here (true pose, true-frame heading), like the rest of this
+        module."""
         cfg = self.cfg
         drone_xy = np.asarray(drone_xyz[:2], dtype=float)
+        est_xy = None if own_estimated_xy is None else np.asarray(own_estimated_xy, dtype=float)
+
+        def _placed(relative_xy):
+            return est_xy + rotate_xy(relative_xy, own_yaw_error_rad)
+
         raw = []
 
         for vid in range(len(self.victims_xy)):
@@ -163,14 +192,16 @@ class VictimSensorModel:
                 continue
             if self.rng.random() < cfg.victim_sensor_false_negative_prob:
                 continue
-            noisy_xy = victim_xy + self.rng.normal(scale=cfg.victim_sensor_noise_std_m, size=2)
+            noise_xy = self.rng.normal(scale=cfg.victim_sensor_noise_std_m, size=2)
+            noisy_xy = victim_xy + noise_xy if est_xy is None else _placed(rel_xy + noise_xy)
             raw.append((noisy_xy, cfg.victim_sensor_confidence))
 
         if self.rng.random() < cfg.victim_sensor_false_positive_rate:
             r = float(self.rng.uniform(0.5, cfg.victim_sensor_range_m))
             theta = float(self.rng.uniform(-1.0, 1.0)) * math.radians(cfg.victim_sensor_hfov_deg) / 2.0
             ang = facing_angle(heading_xy) + theta
-            phantom_xy = drone_xy + r * np.array([math.cos(ang), math.sin(ang)])
+            phantom_rel = r * np.array([math.cos(ang), math.sin(ang)])
+            phantom_xy = drone_xy + phantom_rel if est_xy is None else _placed(phantom_rel)
             raw.append((phantom_xy, cfg.victim_sensor_false_positive_confidence))
 
         # Candidate IDs are assigned here, after real and phantom entries are
@@ -275,12 +306,24 @@ class NeighborSensorModel:
         self._last_seen = [dict() for _ in range(num_drones)]  # last_seen[i][j] = {...}
         self._inflight = []  # (deliver_step, i, j, pos, vel, dist, sample_step)
 
-    def tick(self, positions, velocities, headings) -> None:
+    def tick(self, positions, velocities, headings, own_estimated_positions=None, own_yaw_errors=None) -> None:
         """positions/velocities: ground-truth Nx3 arrays - the hidden
         plant input this sensor is allowed to read (see module
         docstring). headings: per-drone facing-direction unit vectors -
         each drone's OWN state (used only for that drone's own FOV
-        check), not another drone's ground truth."""
+        check), not another drone's ground truth.
+
+        Phase 16B: an onboard neighbour sensor measures the neighbour
+        RELATIVE to the observer, which the observer then places in its own
+        frame using its own pose estimate. With `own_estimated_positions`
+        (Nx3, each observer's estimated position) and `own_yaw_errors` (N,
+        each observer's estimated-minus-true heading) given, the reported
+        position is `estimate_i + R(yaw_error_i) * (relative vector + noise)`
+        and the reported velocity is `R(yaw_error_i) * (velocity + noise)`,
+        so an observer's own drift cancels out of the relative geometry the
+        safety supervisor uses (separation) but shows up in absolute
+        position. Omitted (default) = the legacy absolute output, bit for
+        bit. `headings` must already be in the true frame in that mode."""
         cfg = self.cfg
         cur = self.step
         deliver_step = cur + cfg.neighbor_sensor_latency_steps
@@ -298,8 +341,15 @@ class NeighborSensorModel:
                     continue
                 if self.rng.random() < cfg.neighbor_sensor_dropout_prob:
                     continue
-                noisy_pos = positions[j] + self.rng.normal(scale=cfg.neighbor_sensor_noise_std_m, size=3)
-                noisy_vel = velocities[j] + self.rng.normal(scale=cfg.neighbor_sensor_velocity_noise_std_mps, size=3)
+                pos_noise = self.rng.normal(scale=cfg.neighbor_sensor_noise_std_m, size=3)
+                vel_noise = self.rng.normal(scale=cfg.neighbor_sensor_velocity_noise_std_mps, size=3)
+                if own_estimated_positions is None:
+                    noisy_pos = positions[j] + pos_noise
+                    noisy_vel = velocities[j] + vel_noise
+                else:
+                    yaw_err = 0.0 if own_yaw_errors is None else float(own_yaw_errors[i])
+                    noisy_pos = np.asarray(own_estimated_positions[i], dtype=float) + rotate_xy(rel + pos_noise, yaw_err)
+                    noisy_vel = rotate_xy(velocities[j] + vel_noise, yaw_err)
                 self._inflight.append((deliver_step, i, j, noisy_pos.copy(), noisy_vel.copy(), dist, cur))
 
         still_pending = []

@@ -417,6 +417,18 @@ class TestMissionMap:
         assert m.launch_zone == LaunchZone()
         assert m.grid.cell_of((0.0, 0.0)) == CellIndex(20, 20)
 
+    def test_centered_square_relaxation_flags_accept_what_the_legacy_mission_accepts(self):
+        # FloodSearchMission takes any arena_size; the strict checks stay on by default.
+        with pytest.raises(ValueError, match="whole multiple"):
+            MissionMap.centered_square(15.5)
+        odd = MissionMap.centered_square(15.5, allow_partial_cells=True)
+        assert (odd.grid.n_cols, odd.grid.n_rows) == (16, 16)
+        assert odd.to_geofence(0.5, 8.0).half_extents_m == (7.75, 7.75)
+        with pytest.raises(ValueError, match="outside the search area"):
+            MissionMap.centered_square(2.0)
+        tiny = MissionMap.centered_square(2.0, allow_zone_outside_area=True)
+        assert tiny.allow_zone_outside_area is True and tiny.grid.n_cells == 4
+
     def test_zone_larger_than_area_is_rejected_unless_allowed(self):
         with pytest.raises(ValueError, match="outside the search area"):
             MissionMap.centered_square(2.0)

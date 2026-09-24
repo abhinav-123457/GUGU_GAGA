@@ -2,6 +2,7 @@ import argparse
 import os
 
 from swarm_sim.config import MissionConfig
+from swarm_sim.estimation import PROFILES
 from swarm_sim.mission import FloodSearchMission
 
 
@@ -29,6 +30,18 @@ def build_parser():
     parser.add_argument("--consensus-mode", choices=["distributed", "centralized"], default="distributed",
                          help="distributed: peer-local consensus over CommsNetwork (Phase 5, default); "
                               "centralized: reference ConsensusBoard implementation, for comparison")
+    parser.add_argument("--localization", choices=["truth_state", "estimated"], default="truth_state",
+                         help="truth_state: drones act on simulator ground truth (default, legacy); "
+                              "estimated: GNSS-denied - each drone dead-reckons its own drifting pose "
+                              "(Phase 16B, docs/PHASE16B_ESTIMATION.md)")
+    parser.add_argument("--estimator-profile", choices=sorted(PROFILES), default="fused",
+                         help="odometry drift profile used with --localization estimated "
+                              "(illustrative, not hardware-verified)")
+    parser.add_argument("--estimator-noise-scale", type=float, default=1.0,
+                         help="estimator noise multiplier; < 1 makes the estimator over-confident")
+    parser.add_argument("--geofence-sigma-k", type=float, default=0.0,
+                         help="widen the geofence response by k x the drone's own position uncertainty "
+                              "(0 = off, the legacy behaviour)")
     return parser
 
 
@@ -50,6 +63,10 @@ def main():
         comm_latency_steps=args.comm_latency,
         consensus_quorum=args.consensus_quorum,
         consensus_mode=args.consensus_mode,
+        localization_mode=args.localization,
+        estimator_profile=args.estimator_profile,
+        estimator_assumed_noise_scale=args.estimator_noise_scale,
+        safety_pose_sigma_geofence_k=args.geofence_sigma_k,
     )
 
     mission = FloodSearchMission(cfg)
@@ -73,6 +90,18 @@ def main():
     print(f"  Min sensor-observed neighbor clearance: {result['min_sensor_observed_clearance_m']} m")
     print(f"  Min ground-truth neighbor clearance (scoring only): {result['min_ground_truth_clearance_m']} m")
     print(f"  Steps with a PyBullet contact involving a drone: {result['contact_steps']}")
+    geo = result["true_geofence"]
+    print(f"  True geofence excursions (scoring only): {geo['ticks_outside']}/{geo['ticks']} drone-ticks outside, "
+          f"worst {geo['max_excursion_m']:.2f} m")
+    loc = result["localization"]
+    if loc is not None:
+        print(f"\nPhase 16B GNSS-denied localization ({result['estimator_profile']} profile, illustrative drift model):")
+        print(f"  Estimate error: mean {loc['mean_error_m']:.2f} m, worst {loc['max_error_m']:.2f} m; "
+              f"final drift {100 * (loc['mean_final_drift_fraction'] or 0.0):.2f}% of path")
+        print(f"  NEES {loc['mean_nees']:.2f} (2 = consistent, higher = over-confident); "
+              f"estimated 1x1 m cell was the true one {100 * loc['mean_cell_match_fraction']:.0f}% of the time")
+        print(f"  Estimator invalid {100 * loc['mean_invalid_tick_fraction']:.1f}% of ticks; "
+              f"beacons raised for unverified confirmations: {result['synthetic_beacon_count']}")
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     result["telemetry"].save_csv(args.out)
